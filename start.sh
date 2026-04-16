@@ -57,23 +57,75 @@ echo -e "${CYAN}╚════════════════════�
 echo ""
 
 # ── Hard prerequisites ────────────────────────────────────────────────────────
-command -v docker  >/dev/null 2>&1 || { error "Docker not found. Install Docker Desktop for Mac."; exit 1; }
-command -v python3 >/dev/null 2>&1 || { error "python3 not found. Run: brew install python@3.11"; exit 1; }
+command -v docker >/dev/null 2>&1 || { error "Docker not found. Install Docker Desktop for Mac."; exit 1; }
 
-# ── Step 1: Python virtual environment ───────────────────────────────────────
+# ── Step 1: Find compatible Python (3.10–3.12 required) ──────────────────────
+#
+#  PyTorch, transformers, and accelerate do NOT support Python 3.13+.
+#  The "Cannot copy out of meta tensor" error is a Python 3.13/3.14 symptom.
+#  We prefer python3.12 → 3.11 → 3.10 in that order.
+#
+info "Checking Python version..."
+
+SYSTEM_PYTHON=""
+for cmd in python3.12 python3.11 python3.10; do
+    if command -v "$cmd" >/dev/null 2>&1; then
+        SYSTEM_PYTHON="$cmd"
+        break
+    fi
+done
+
+# Fallback: check if bare python3 is in the compatible range
+if [ -z "$SYSTEM_PYTHON" ] && command -v python3 >/dev/null 2>&1; then
+    _minor=$(python3 -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
+    _major=$(python3 -c "import sys; print(sys.version_info.major)" 2>/dev/null || echo "0")
+    if [ "$_major" -eq 3 ] && [ "$_minor" -ge 10 ] && [ "$_minor" -le 12 ]; then
+        SYSTEM_PYTHON="python3"
+    fi
+fi
+
+if [ -z "$SYSTEM_PYTHON" ]; then
+    error "No compatible Python found (need 3.10–3.12)."
+    error "Python 3.13+ is NOT yet supported by PyTorch / transformers."
+    error ""
+    error "Fix:  brew install python@3.11"
+    error "Then: rm -rf '${VENV_DIR}' && ./start.sh"
+    exit 1
+fi
+
+PY_VER=$("$SYSTEM_PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}.{sys.version_info.micro}')")
+success "Using ${SYSTEM_PYTHON}  (Python ${PY_VER})"
+
+# ── Step 2: Python virtual environment ───────────────────────────────────────
+#
+#  If the existing venv was created with an incompatible Python (e.g. 3.14),
+#  delete it automatically and rebuild with the correct version.
+#
+if [ -f "${VENV_DIR}/bin/python3" ]; then
+    _vminor=$("${VENV_DIR}/bin/python3" -c "import sys; print(sys.version_info.minor)" 2>/dev/null || echo "0")
+    _vmajor=$("${VENV_DIR}/bin/python3" -c "import sys; print(sys.version_info.major)" 2>/dev/null || echo "0")
+    if ! { [ "$_vmajor" -eq 3 ] && [ "$_vminor" -ge 10 ] && [ "$_vminor" -le 12 ]; }; then
+        warn "Existing venv uses Python ${_vmajor}.${_vminor} (incompatible) — rebuilding..."
+        rm -rf "$VENV_DIR"
+        # Force deps reinstall since venv is new
+        rm -f "${VENV_DIR}/.deps_installed" 2>/dev/null || true
+    fi
+fi
+
 if [ ! -f "${VENV_DIR}/bin/python3" ]; then
-    info "Creating Python virtual environment..."
-    python3 -m venv "$VENV_DIR"
-    success "Virtual environment created at ${VENV_DIR}"
+    info "Creating virtual environment with Python ${PY_VER}..."
+    "$SYSTEM_PYTHON" -m venv "$VENV_DIR"
+    success "Virtual environment created"
 else
-    success "Virtual environment found"
+    _vver=$("${VENV_DIR}/bin/python3" --version 2>&1)
+    success "Virtual environment found  (${_vver})"
 fi
 
 # All Python commands use the venv from here on
 PYTHON="${VENV_DIR}/bin/python3"
 PIP="${VENV_DIR}/bin/pip"
 
-# ── Step 2: Install / verify dependencies ────────────────────────────────────
+# ── Step 3: Install / verify dependencies ────────────────────────────────────
 # Use a sentinel file so we only re-run pip when requirements.txt changes.
 SENTINEL="${VENV_DIR}/.deps_installed"
 if [ ! -f "$SENTINEL" ] || [ "$REQUIREMENTS" -nt "$SENTINEL" ]; then
@@ -86,7 +138,7 @@ else
     success "Dependencies up to date"
 fi
 
-# ── Step 3: Download DotsOCR model weights (first run only, ~7 GB) ───────────
+# ── Step 4: Download DotsOCR model weights (first run only, ~7 GB) ───────────
 if [ ! -d "$WEIGHTS_DIR" ] || [ -z "$(ls -A "$WEIGHTS_DIR" 2>/dev/null)" ]; then
     info "DotsOCR weights not found — downloading from HuggingFace (~7 GB)..."
     info "This is a one-time download. Go grab a coffee ☕"
@@ -101,7 +153,7 @@ else
     success "DotsOCR weights found at ${WEIGHTS_DIR}"
 fi
 
-# ── Step 4: Verify MPS (informational only) ───────────────────────────────────
+# ── Step 5: Verify MPS (informational only) ───────────────────────────────────
 "$PYTHON" -c "
 import torch
 if torch.backends.mps.is_available():
@@ -110,7 +162,7 @@ else:
     print('  MPS not available — falling back to CPU (much slower)')
 " 2>/dev/null || true
 
-# ── Step 5: Start Docker infrastructure ──────────────────────────────────────
+# ── Step 6: Start Docker infrastructure ──────────────────────────────────────
 info "Starting Redis + RabbitMQ in Docker..."
 cd "$REPO_ROOT"
 docker compose up redis rabbitmq -d --wait 2>/dev/null || docker compose up redis rabbitmq -d
@@ -132,7 +184,7 @@ for i in $(seq 1 30); do
 done
 success "RabbitMQ ready"
 
-# ── Step 6: Set native environment ───────────────────────────────────────────
+# ── Step 7: Set native environment ───────────────────────────────────────────
 info "Configuring native Python environment (MPS)..."
 
 # Load .env file
@@ -174,7 +226,7 @@ echo "  PG          : ${PG_HOST}:${PG_PORT}/${PG_DATABASE}"
 echo "  SeaweedFS   : ${SEAWEEDFS_S3_ENDPOINT}"
 echo ""
 
-# ── Step 7: Start FastAPI (api) natively ─────────────────────────────────────
+# ── Step 8: Start FastAPI (api) natively ─────────────────────────────────────
 info "Starting FastAPI API server (port 8000)..."
 
 RUN_TYPE=api "$PYTHON" "${APP_DIR}/main.py" \
@@ -191,7 +243,7 @@ fi
 success "API running (pid=${API_PID})  →  http://localhost:8000"
 success "Health check: curl http://localhost:8000/health"
 
-# ── Step 8: Start Stage Pipeline worker (single process) ─────────────────────
+# ── Step 9: Start Stage Pipeline worker (single process, no web server) ──────
 #
 #  The stage pipeline manages all concurrency internally:
 #    Preprocess  : 6 CPU threads  (OpenCV)

@@ -202,5 +202,106 @@ async def serve_ui():
         return HTMLResponse(_UI_FILE.read_text(encoding="utf-8"))
     return HTMLResponse("<h2>UI not found — check src/static/index.html</h2>", status_code=404)
 
+async def _run_worker_only():
+    """
+    Worker mode: initialise all services and run the stage pipeline +
+    RabbitMQ feeders WITHOUT starting a web server.
+
+    The API process (RUN_TYPE=api) owns port 8000.
+    The worker process never touches uvicorn or any port.
+    """
+    global _pool_pg, _rsm, _mq_conn, _pipeline, _worker_pool, _ids
+
+    # 1. PostgreSQL
+    try:
+        _pool_pg = get_pg_pool(minconn=1, maxconn=cfg.upload_workers + 5)
+        conn = _pool_pg.getconn()
+        conn.autocommit = True
+        create_schema(conn)
+        _ids = _init_system_defaults(RBACManager(conn))
+        _pool_pg.putconn(conn)
+        logger.info("PostgreSQL ready")
+    except Exception as e:
+        logger.error("PostgreSQL init failed: %s", e)
+
+    # 2. Redis
+    try:
+        _rsm = RedisStateManager()
+        logger.info("Redis connected")
+    except Exception as e:
+        logger.error("Redis init failed: %s", e)
+
+    # 3. RabbitMQ
+    try:
+        _mq_conn = rabbit_connect()
+        setup_topology(_mq_conn)
+        logger.info("RabbitMQ topology ready")
+    except Exception as e:
+        logger.error("RabbitMQ init failed: %s", e)
+
+    # 4. SeaweedFS
+    _storage_service = None
+    try:
+        from src.storage import SeaweedFSClient, StorageService
+        _sw_client = SeaweedFSClient(
+            endpoint_url=cfg.SEAWEEDFS_S3_ENDPOINT,
+            aws_access_key_id=cfg.SEAWEEDFS_ACCESS_KEY,
+            aws_secret_access_key=cfg.SEAWEEDFS_SECRET_KEY,
+            bucket=cfg.SEAWEEDFS_BUCKET,
+        )
+        _storage_service = StorageService(_sw_client)
+        try:
+            ok = await _sw_client.health_check()
+            logger.info("SeaweedFS %s", "healthy" if ok else "unreachable — continuing without it")
+        except Exception:
+            logger.warning("SeaweedFS unreachable — continuing without it")
+    except Exception as e:
+        logger.warning("SeaweedFS init skipped: %s", e)
+
+    # 5. Stage pipeline + workers
+    _pipeline = RAGPipeline(_pool_pg, _rsm, storage=_storage_service)
+    _pipeline.start()
+    logger.info("StagePipeline started (all stage workers active)")
+
+    # 6. RabbitMQ feeders
+    if _mq_conn:
+        _worker_pool = WorkerPool(_rsm, _pipeline, n=3)
+        _worker_pool.start()
+        logger.info("WorkerPool (RabbitMQ feeders) started")
+
+    # Block until SIGINT / SIGTERM
+    shutdown = asyncio.Event()
+    import signal
+    loop = asyncio.get_running_loop()
+    for sig in (signal.SIGINT, signal.SIGTERM):
+        try:
+            loop.add_signal_handler(sig, shutdown.set)
+        except (NotImplementedError, OSError):
+            pass
+
+    logger.info("Worker ready — listening for jobs (Ctrl+C to stop)")
+    await shutdown.wait()
+
+    # Graceful shutdown
+    logger.info("Worker shutting down…")
+    if _worker_pool:
+        _worker_pool.stop()
+    _pipeline.stop(timeout=30.0)
+    if _mq_conn:
+        try:
+            _mq_conn.close()
+        except Exception:
+            pass
+    if _pool_pg:
+        _pool_pg.closeall()
+    logger.info("Worker shutdown complete")
+
+
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    run_type = os.getenv("RUN_TYPE", "worker")
+    if run_type == "api":
+        # API process: full FastAPI + uvicorn on port 8000
+        uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")
+    else:
+        # Worker process: no web server — just the stage pipeline + RabbitMQ feeders
+        asyncio.run(_run_worker_only())
