@@ -65,38 +65,58 @@ class DotsOCRParser:
             print(f"use vllm model, num_thread will be set to {self.num_thread}")
 
     def _load_hf_model(self):
+        import io
         import warnings
+        import contextlib
         import torch
         import transformers as _transformers
         from transformers import AutoModelForCausalLM, AutoProcessor
         from qwen_vl_utils import process_vision_info
-        from dots_ocr.utils.device_utils import get_device, get_attn_implementation
+        from dots_ocr.utils.device_utils import get_device
 
         model_path = self.model_path
         device = get_device()
         dtype = torch.bfloat16 if device in ("mps", "cuda") else torch.float32
 
-        # Suppress flash-attention warnings — not supported on MPS/CPU and
-        # the repeated "flash attention not available!" messages clutter logs.
+        # Suppress transformers-level logging and Python warnings during load.
         _prev_verbosity = _transformers.logging.get_verbosity()
         _transformers.logging.set_verbosity_error()
         warnings.filterwarnings("ignore", message=".*[Ff]lash.?[Aa]ttention.*")
         warnings.filterwarnings("ignore", message=".*flash_attn.*")
+        warnings.filterwarnings("ignore", message=".*FutureWarning.*")
 
         try:
-            # Do NOT pass device_map="auto" — accelerate uses meta tensors to
-            # plan placement, then calls model.to(device) on them, which raises
-            # "Cannot copy out of meta tensor" on MPS.  Load on CPU first,
-            # then move to the target device with a plain .to() call.
-            self.model = AutoModelForCausalLM.from_pretrained(
-                model_path,
-                attn_implementation=get_attn_implementation(),
-                torch_dtype=dtype,
-                trust_remote_code=True,
-            )
+            # Key fixes for MPS (Apple Silicon):
+            #
+            # 1. No device_map="auto" — accelerate creates meta tensors and then
+            #    calls model.to(device), which raises "Cannot copy out of meta
+            #    tensor" on MPS.  We load to CPU first and move manually below.
+            #
+            # 2. low_cpu_mem_usage=False — transformers ≥4.38 silently enables
+            #    low_cpu_mem_usage=True as default even without device_map, which
+            #    also creates meta tensors.  Explicitly disable it.
+            #
+            # 3. attn_implementation="eager" — most compatible across all
+            #    transformers versions on MPS/CPU.  SDPA and flash_attention_2
+            #    both print "flash attention not available!" spam via print()
+            #    on every attention layer init.  "eager" avoids this entirely.
+            #
+            # 4. contextlib.redirect_stdout — catches any remaining print()
+            #    calls from within trust_remote_code model init (e.g. the
+            #    "flash attention not available! fallback to eager" messages
+            #    emitted by the DotsOCR attention layers regardless of attn_impl).
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    attn_implementation="eager",
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                    low_cpu_mem_usage=False,
+                )
         finally:
             _transformers.logging.set_verbosity(_prev_verbosity)
 
+        # Move from CPU to target device (safe — no meta tensors at this point)
         self.model = self.model.to(device)
         self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=True, use_fast=True

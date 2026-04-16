@@ -55,14 +55,18 @@ class MxbaiEmbedder:
 
         logger.info("Loading embedding model '%s' on device '%s' (batch_size=%d)",
                     self._model_name, self._device, self._batch_size)
+        # model_kwargs passed to the underlying from_pretrained call:
+        #   device_map=None    — prevents accelerate meta-tensor placement
+        #   low_cpu_mem_usage=False — prevents transformers ≥4.38 from enabling
+        #                            meta tensors as default (even without device_map)
+        _safe_kwargs = {"device_map": None, "low_cpu_mem_usage": False}
+
         try:
-            # Pass device_map=None to prevent accelerate from using meta tensors,
-            # which cause "Cannot copy out of meta tensor" on MPS.
             try:
                 model = SentenceTransformer(
                     self._model_name,
                     device=self._device,
-                    model_kwargs={"device_map": None},
+                    model_kwargs=_safe_kwargs,
                 )
             except TypeError:
                 # Older sentence-transformers without model_kwargs support
@@ -78,7 +82,7 @@ class MxbaiEmbedder:
                         model = SentenceTransformer(
                             self._model_name,
                             device="cpu",
-                            model_kwargs={"device_map": None},
+                            model_kwargs=_safe_kwargs,
                         )
                     except TypeError:
                         model = SentenceTransformer(self._model_name, device="cpu")
