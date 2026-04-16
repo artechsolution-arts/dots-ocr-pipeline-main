@@ -65,29 +65,42 @@ class DotsOCRParser:
             print(f"use vllm model, num_thread will be set to {self.num_thread}")
 
     def _load_hf_model(self):
+        import warnings
         import torch
-        from transformers import AutoModelForCausalLM, AutoProcessor, AutoTokenizer
+        import transformers as _transformers
+        from transformers import AutoModelForCausalLM, AutoProcessor
         from qwen_vl_utils import process_vision_info
         from dots_ocr.utils.device_utils import get_device, get_attn_implementation
 
         model_path = self.model_path
         device = get_device()
-        if device == "mps" or device == "cuda":
-            dtype = torch.bfloat16
-        elif device == "cpu":
-            dtype = torch.float32
-        else:
-            dtype = torch.bfloat16
+        dtype = torch.bfloat16 if device in ("mps", "cuda") else torch.float32
 
-        self.model = AutoModelForCausalLM.from_pretrained(
-            model_path,
-            attn_implementation=get_attn_implementation(),
-            torch_dtype=dtype,
-            device_map="auto",
-            trust_remote_code=True
+        # Suppress flash-attention warnings — not supported on MPS/CPU and
+        # the repeated "flash attention not available!" messages clutter logs.
+        _prev_verbosity = _transformers.logging.get_verbosity()
+        _transformers.logging.set_verbosity_error()
+        warnings.filterwarnings("ignore", message=".*[Ff]lash.?[Aa]ttention.*")
+        warnings.filterwarnings("ignore", message=".*flash_attn.*")
+
+        try:
+            # Do NOT pass device_map="auto" — accelerate uses meta tensors to
+            # plan placement, then calls model.to(device) on them, which raises
+            # "Cannot copy out of meta tensor" on MPS.  Load on CPU first,
+            # then move to the target device with a plain .to() call.
+            self.model = AutoModelForCausalLM.from_pretrained(
+                model_path,
+                attn_implementation=get_attn_implementation(),
+                torch_dtype=dtype,
+                trust_remote_code=True,
+            )
+        finally:
+            _transformers.logging.set_verbosity(_prev_verbosity)
+
+        self.model = self.model.to(device)
+        self.processor = AutoProcessor.from_pretrained(
+            model_path, trust_remote_code=True, use_fast=True
         )
-        self.model.to(dtype)
-        self.processor = AutoProcessor.from_pretrained(model_path,  trust_remote_code=True,use_fast=True)
         self.process_vision_info = process_vision_info
 
     def _inference_with_hf(self, image, prompt):

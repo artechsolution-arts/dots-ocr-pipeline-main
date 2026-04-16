@@ -40,10 +40,33 @@ class MxbaiEmbedder:
             logger.error("sentence-transformers not installed")
             return None
 
+        import warnings
+        try:
+            import transformers as _transformers
+            _prev_verbosity = _transformers.logging.get_verbosity()
+            _transformers.logging.set_verbosity_error()
+        except Exception:
+            _transformers = None
+            _prev_verbosity = None
+
+        # Suppress flash-attention warnings that don't apply to MPS/CPU
+        warnings.filterwarnings("ignore", message=".*[Ff]lash.?[Aa]ttention.*")
+        warnings.filterwarnings("ignore", message=".*flash_attn.*")
+
         logger.info("Loading embedding model '%s' on device '%s' (batch_size=%d)",
                     self._model_name, self._device, self._batch_size)
         try:
-            model = SentenceTransformer(self._model_name, device=self._device)
+            # Pass device_map=None to prevent accelerate from using meta tensors,
+            # which cause "Cannot copy out of meta tensor" on MPS.
+            try:
+                model = SentenceTransformer(
+                    self._model_name,
+                    device=self._device,
+                    model_kwargs={"device_map": None},
+                )
+            except TypeError:
+                # Older sentence-transformers without model_kwargs support
+                model = SentenceTransformer(self._model_name, device=self._device)
             logger.info("Embedding model loaded (dim=%d)", self._embed_dim)
             return model
         except Exception as e:
@@ -51,13 +74,23 @@ class MxbaiEmbedder:
             if self._device != "cpu":
                 logger.info("Retrying on CPU…")
                 try:
-                    model = SentenceTransformer(self._model_name, device="cpu")
+                    try:
+                        model = SentenceTransformer(
+                            self._model_name,
+                            device="cpu",
+                            model_kwargs={"device_map": None},
+                        )
+                    except TypeError:
+                        model = SentenceTransformer(self._model_name, device="cpu")
                     self._device = "cpu"
                     logger.info("Embedding model loaded on CPU fallback")
                     return model
                 except Exception as e2:
                     logger.error("CPU fallback also failed: %s", e2)
             return None
+        finally:
+            if _transformers is not None and _prev_verbosity is not None:
+                _transformers.logging.set_verbosity(_prev_verbosity)
 
     # ── Public API ────────────────────────────────────────────────────────────
 
