@@ -142,7 +142,14 @@ class RedisStateManager:
             try: self.r.publish(RK.progress_ch(session_id), json.dumps(event))
             except Exception: pass
 
-    def subscribe_session(self, session_id: str):
+    def subscribe_session(self, session_id: str, stop_event=None):
+        """
+        Generator that yields Redis pub/sub events for a session.
+
+        stop_event: optional threading.Event — when set, the generator exits
+        cleanly and releases the Redis pub/sub connection.  Always pass one
+        from the SSE handler so the connection is freed on client disconnect.
+        """
         summary = self.session_summary(session_id)
         if summary and summary.get("status") == "complete":
             yield {"type": "session_complete", "data": summary}
@@ -153,16 +160,27 @@ class RedisStateManager:
         try:
             deadline = time.time() + SESSION_TTL
             while time.time() < deadline:
-                msg = pub.get_message(timeout=30)
-                if msg is None: yield {"type": "ping"}; continue
+                # Check stop_event frequently so client disconnects release
+                # the Redis connection promptly (previously held for SESSION_TTL)
+                if stop_event and stop_event.is_set():
+                    break
+                msg = pub.get_message(timeout=1)   # 1 s — responsive to stop_event
+                if msg is None:
+                    yield {"type": "ping"}
+                    continue
                 try:
                     data = json.loads(msg["data"])
                     yield data
-                    if data.get("type") == "session_complete": break
-                except Exception: continue
+                    if data.get("type") == "session_complete":
+                        break
+                except Exception:
+                    continue
         finally:
-            try: pub.unsubscribe(ch); pub.close()
-            except Exception: pass
+            try:
+                pub.unsubscribe(ch)
+                pub.close()
+            except Exception:
+                pass
 
     def check_rate_limit(self, dept_id, limit=200, window_s=3600) -> Tuple[bool, int]:
         pipe = self.r.pipeline(transaction=True)

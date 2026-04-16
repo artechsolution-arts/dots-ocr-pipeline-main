@@ -24,13 +24,16 @@ class DocJob:
     file_id:      str
     session_id:   str
     filename:     str
-    raw_bytes:    bytes
+    # Path on local disk where the PDF is stored.  Raw bytes are NOT kept in
+    # the DocJob so that _doc_q can hold thousands of entries without consuming
+    # gigabytes of RAM.  Each preprocess worker reads from disk only when it
+    # dequeues a job — at most N_PREPROCESS files in memory at once.
+    file_path:    str
     user_id:      str
     dept_id:      str
     upload_id:    Optional[str] = None
     upload_type:  str = "user"
-    # SHA-256 of raw_bytes computed in preprocess worker so the single
-    # assembler thread never has to hash a 200 MB PDF.
+    # SHA-256 of the PDF bytes, computed in the preprocess worker.
     content_hash: str = ""
 
 

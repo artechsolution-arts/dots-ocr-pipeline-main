@@ -98,27 +98,9 @@ def create_router(rsm, ids, pipeline, mq_conn):
         if not rsm or not rsm.ping():
             raise HTTPException(503, "Redis is offline — cannot accept ingestion jobs")
 
-        # Batch size cap
-        if len(files) > cfg.max_batch_files:
-            raise HTTPException(
-                400,
-                f"Batch too large: {len(files)} files submitted, maximum is {cfg.max_batch_files}",
-            )
-
         # Resolve dept/user — fall back to seeded system defaults
         resolved_dept = dept_id or ids.get("dept_default")
         resolved_user = user_id or ids.get("user_default")
-
-        # Rate limiting per department
-        allowed, count = rsm.check_rate_limit(str(resolved_dept))
-        if not allowed:
-            raise HTTPException(
-                429,
-                f"Rate limit exceeded: {count} files submitted this hour "
-                f"(limit: 200). Try again later.",
-            )
-
-        max_bytes = int(cfg.max_pdf_size_mb * 1024 * 1024)
         session_id = str(uuid.uuid4())
         session = BatchSession(
             session_id=session_id,
@@ -137,13 +119,7 @@ def create_router(rsm, ids, pipeline, mq_conn):
 
             contents = await f.read()
 
-            if len(contents) > max_bytes:
-                raise HTTPException(
-                    413,
-                    f"'{f.filename}' exceeds {cfg.max_pdf_size_mb} MB limit",
-                )
-
-            # Magic byte check — reject non-PDF bytes regardless of file extension
+            # Magic byte check — reject non-PDF content regardless of filename
             if not contents.startswith(b"%PDF-"):
                 raise HTTPException(
                     400,
@@ -241,13 +217,16 @@ def create_router(rsm, ids, pipeline, mq_conn):
                 for f in summary.get("files", []):
                     yield f"data: {json.dumps({'type': 'file_progress', 'data': f})}\n\n"
 
-            # Bridge the blocking Redis Pub/Sub into an async generator
-            q = asyncio.Queue()
+            # stop_event is set when the client disconnects, signalling the
+            # Redis subscription thread to exit and release its connection.
+            stop_event = threading.Event()
+            q    = asyncio.Queue()
             loop = asyncio.get_running_loop()
 
             def _subscribe():
                 try:
-                    for event in rsm.subscribe_session(session_id):
+                    for event in rsm.subscribe_session(session_id,
+                                                       stop_event=stop_event):
                         loop.call_soon_threadsafe(q.put_nowait, event)
                 except Exception as e:
                     logger.warning("SSE subscribe error: %s", e)
@@ -257,11 +236,15 @@ def create_router(rsm, ids, pipeline, mq_conn):
             thread = threading.Thread(target=_subscribe, daemon=True)
             thread.start()
 
-            while True:
-                event = await q.get()
-                if event is None:
-                    break
-                yield f"data: {json.dumps(event)}\n\n"
+            try:
+                while True:
+                    event = await q.get()
+                    if event is None:
+                        break
+                    yield f"data: {json.dumps(event)}\n\n"
+            finally:
+                # Client disconnected or session complete — release Redis connection
+                stop_event.set()
 
         return StreamingResponse(_event_stream(), media_type="text/event-stream")
 

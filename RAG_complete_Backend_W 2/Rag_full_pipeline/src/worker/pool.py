@@ -138,15 +138,17 @@ class PDFWorker:
             if not fpath.exists():
                 raise FileNotFoundError(f"PDF missing on disk: {fpath}")
 
-            raw_bytes = fpath.read_bytes()
-            logger.info("[Feeder %s] Submitting '%s' (%.1f KB) to pipeline",
-                        self.worker_id[:8], job.filename, len(raw_bytes) / 1024)
+            # Do NOT read raw bytes here — keeps _doc_q memory-lean so thousands
+            # of jobs can be queued simultaneously without filling RAM.
+            # The preprocess worker reads the file from disk when it dequeues.
+            logger.info("[Feeder %s] Queuing '%s' (%.1f KB) for pipeline",
+                        self.worker_id[:8], job.filename, fpath.stat().st_size / 1024)
 
             doc_job = DocJob(
                 file_id=job.file_id,
                 session_id=job.session_id,
                 filename=job.filename,
-                raw_bytes=raw_bytes,
+                file_path=str(fpath),
                 user_id=job.user_id,
                 dept_id=job.dept_id,
                 upload_id=getattr(job, "upload_id", None),

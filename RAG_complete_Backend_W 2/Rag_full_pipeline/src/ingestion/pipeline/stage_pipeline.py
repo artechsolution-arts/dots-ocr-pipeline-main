@@ -4,8 +4,8 @@ Stage Pipeline  —  M3 Ultra  (24 perf + 8 eff CPU cores, 80-core MPS GPU)
 
 ┌─ Stage 1 ──────────────────────────────────────────────────┐
 │  Preprocessing  · 6 CPU threads                            │
-│  PDF bytes → OpenCV enhanced PIL pages (streamed)          │
-│  Also computes SHA-256 of raw PDF bytes (stored in DocJob) │
+│  Reads PDF from disk → SHA-256 → dedup check → pages      │
+│  Skips immediately if doc already in Postgres or Redis     │
 └────────────────────────────┬───────────────────────────────┘
                              │ page_q  (maxsize=60)
 ┌─ Stage 2+3 ────────────────▼───────────────────────────────┐
@@ -38,8 +38,16 @@ Stage Pipeline  —  M3 Ultra  (24 perf + 8 eff CPU cores, 80-core MPS GPU)
 ┌─ Stage 7 ──────────────────▼───────────────────────────────┐
 │  Storage Writers  · 4 IO threads                           │
 │  PostgreSQL: chunks + pgvector embeddings                  │
+│  Sets Redis 1-year dedup key after successful storage      │
 │  Deletes the local upload file after successful storage    │
 └────────────────────────────────────────────────────────────┘
+
+Memory model for 500+ documents
+--------------------------------
+DocJob carries only a file_path (not raw bytes).  _doc_q can hold thousands
+of entries without filling RAM.  Each preprocess worker reads its file from
+disk only when it dequeues a job — at most N_PREPROCESS files are in memory
+simultaneously.  PIL images are bounded by _page_q.maxsize=60.
 """
 
 from __future__ import annotations
@@ -52,7 +60,7 @@ from pathlib import Path
 from queue import Empty, Full, Queue
 from typing import Optional
 
-from src.config import cfg
+from src.config import cfg, UPLOAD_DIR
 from src.ingestion.chunking.chunker import DocumentChunker
 from src.ingestion.embedding.embedder import MxbaiEmbedder
 from src.ingestion.parsing.text_cleaner import TextCleaner
@@ -75,9 +83,8 @@ N_STORE      = 4
 EMBED_BATCH  = int(cfg.embedding_batch)   # default 128
 EMBED_TIMEOUT = 3.0   # seconds — wider window improves GPU batch fill under OCR backpressure
 
-# Max time a document may spend waiting in the assembler for all its pages.
-# If OCR loses a page (worker crash, GPU hang), the document is failed rather
-# than waiting forever.
+# Max time a document may spend in the assembler waiting for all its pages.
+# Prevents in-flight table from leaking on GPU hang / worker crash.
 DOC_ASSEMBLY_TIMEOUT = 600   # 10 minutes
 
 
@@ -93,11 +100,11 @@ class StagePipeline:
         self.storage = storage
 
         # ── Inter-stage queues ────────────────────────────────────────────────
-        # _doc_q is large (500) so RabbitMQ feeders never block pika's heartbeat loop.
-        # _page_q is capped at 60 to bound in-flight PIL image memory (~26 MB each).
-        self._doc_q       = Queue(maxsize=500)    # DocJobs from feeders
-        self._page_q      = Queue(maxsize=60)     # PageJobs (carry PIL images — capped!)
-        self._markdown_q  = Queue(maxsize=300)    # PageMarkdown (text only, cheap)
+        # _doc_q holds only file_path metadata (tiny), so maxsize=5000 is safe
+        # even for 500+ concurrent uploads — no raw bytes are stored here.
+        self._doc_q       = Queue(maxsize=5000)   # DocJobs (file path only — no bytes)
+        self._page_q      = Queue(maxsize=60)     # PageJobs (PIL images — capped!)
+        self._markdown_q  = Queue(maxsize=300)    # PageMarkdown (text only)
         self._assembled_q = Queue(maxsize=50)     # AssembledDoc
         self._chunk_q     = Queue(maxsize=2000)   # ChunkItem
         self._store_q     = Queue(maxsize=2000)   # EmbeddedItem
@@ -142,7 +149,6 @@ class StagePipeline:
         logger.info("StagePipeline shutting down…")
         self._shutdown.set()
         # Inject sentinels so threads blocked on _get() wake immediately.
-        # Threads blocked on _put() also wake because _put() checks _shutdown.
         for _ in range(len(self._threads) * 2):
             for q in (self._doc_q, self._page_q, self._markdown_q,
                       self._assembled_q, self._chunk_q, self._store_q):
@@ -162,10 +168,13 @@ class StagePipeline:
 
     def _preprocess_worker(self):
         """
-        Pulls DocJobs, converts each PDF page to an enhanced PIL image,
-        and pushes PageJobs to the OCR queue.
-        Also computes SHA-256 of the raw bytes here so the single assembler
-        thread never has to hash a large PDF.
+        1. Reads PDF bytes from disk (DocJob carries only file_path).
+        2. Computes SHA-256 → dedup check (Redis fast-path, then Postgres).
+           Skips the entire pipeline if the document already exists — no OCR.
+        3. Streams PDF pages as enhanced PIL images into _page_q.
+
+        At most N_PREPROCESS files are held in memory simultaneously regardless
+        of how many jobs are queued in _doc_q.
         """
         while not self._shutdown.is_set():
             item = self._get(self._doc_q)
@@ -173,14 +182,49 @@ class StagePipeline:
                 break
             doc: DocJob = item
             try:
-                # Compute content hash early so the assembler can skip it
-                doc.content_hash = hashlib.sha256(doc.raw_bytes).hexdigest()
+                # ── Read bytes from disk ──────────────────────────────────────
+                try:
+                    raw_bytes = Path(doc.file_path).read_bytes()
+                except OSError as e:
+                    logger.error("[Preprocess] Cannot read '%s': %s", doc.filename, e)
+                    self._fail(doc.file_id, doc.session_id, f"File read error: {e}")
+                    continue
 
+                # ── SHA-256 ───────────────────────────────────────────────────
+                doc.content_hash = hashlib.sha256(raw_bytes).hexdigest()
+
+                # ── Dedup: Redis fast-path (1-year cache set after completion) ─
+                if self.rsm:
+                    existing_id = self.rsm.check_dedup(doc.content_hash)
+                    if existing_id:
+                        logger.info("[Preprocess] '%s' already processed (cached) — skipped",
+                                    doc.filename)
+                        self._skip(doc.file_id, doc.session_id, doc_id=existing_id)
+                        del raw_bytes
+                        continue
+
+                # ── Dedup: Postgres authoritative check ───────────────────────
+                if self.rbac:
+                    existing_doc_id = self.rbac.find_doc_by_hash(
+                        doc.content_hash, doc.dept_id)
+                    if existing_doc_id:
+                        logger.info(
+                            "[Preprocess] '%s' already exists in Postgres (doc=%s) — skipped",
+                            doc.filename, existing_doc_id)
+                        # Prime Redis cache for future fast-path hits
+                        if self.rsm:
+                            self.rsm.set_dedup(doc.content_hash, existing_doc_id)
+                        self._skip(doc.file_id, doc.session_id, doc_id=existing_doc_id)
+                        del raw_bytes
+                        continue
+
+                # ── New document — start pipeline ─────────────────────────────
                 self._update_stage(doc.file_id, doc.session_id, "preprocessing", 5,
                                    started_at=time.time())
+
                 pages_yielded = 0
                 for page_idx, total_pages, enhanced, origin in \
-                        self._preprocessor.stream_pages(doc.raw_bytes):
+                        self._preprocessor.stream_pages(raw_bytes):
                     page_job = PageJob(
                         file_id=doc.file_id, session_id=doc.session_id,
                         page_idx=page_idx, total_pages=total_pages,
@@ -189,7 +233,11 @@ class StagePipeline:
                     if not self._put(self._page_q, page_job):
                         break   # Shutdown signalled during put
                     pages_yielded += 1
-                logger.debug("[Preprocess] %s → %d pages queued", doc.filename, pages_yielded)
+
+                # Free bytes — pages have been converted to PIL images in _page_q
+                del raw_bytes
+                logger.debug("[Preprocess] '%s' → %d pages queued", doc.filename, pages_yielded)
+
             except Exception as e:
                 logger.error("[Preprocess] Failed '%s': %s", doc.filename, e, exc_info=True)
                 self._fail(doc.file_id, doc.session_id, str(e))
@@ -199,18 +247,15 @@ class StagePipeline:
     def _ocr_worker(self):
         """
         Each OCR worker owns its own DotsOCRParser loaded onto MPS.
-        If the parser fails to load (GPU init error), the worker retries
-        every 30 s instead of exiting permanently — preserving full OCR capacity
-        once the GPU recovers.
+        If the parser fails to load, the worker retries every 30 s — preserving
+        full OCR capacity once the GPU recovers.
         """
         parser = None
         while not self._shutdown.is_set():
-            # (Re)load parser if not available
             if parser is None:
                 parser = self._load_ocr_parser()
                 if parser is None:
                     logger.error("[OCR] Parser load failed — retrying in 30 s")
-                    # Wait 30 s with shutdown awareness
                     for _ in range(60):
                         if self._shutdown.is_set():
                             return
@@ -235,12 +280,10 @@ class StagePipeline:
                 markdown=markdown, doc_job=pjob.doc_job,
                 error=None if markdown else "ocr_failed",
             )
-            # Release PIL image memory before enqueueing (markdown is text-only)
-            del pjob.image, pjob.origin_image
+            del pjob.image, pjob.origin_image   # Free PIL image memory
             self._put(self._markdown_q, pm)
 
     def _load_ocr_parser(self):
-        """Load a DotsOCRParser onto MPS (one per OCR thread)."""
         try:
             from dots_ocr import DotsOCRParser
             parser = DotsOCRParser(
@@ -287,26 +330,23 @@ class StagePipeline:
 
     def _assembler_worker(self):
         """
-        Accumulates PageMarkdowns per document until all pages arrive,
-        then assembles the full markdown and pushes to chunking.
+        Accumulates PageMarkdowns per document until all pages arrive, then
+        assembles the full markdown and pushes to chunking.
 
-        SeaweedFS upload is fired in a background daemon thread so it never
-        blocks the assembler (previously it blocked for up to 30 s per doc).
+        SeaweedFS upload is fired in a background daemon thread after reading
+        the PDF bytes from disk synchronously — the assembler never blocks on
+        network I/O.
 
-        raw_bytes is cleared from DocJob before pushing AssembledDoc so the
-        full PDF is not carried through Chunking → Embedding → Storage.
-
-        A per-document 10-minute timeout prevents in_flight from leaking
-        entries when OCR loses pages (worker crash, GPU hang).
+        A per-document 10-minute timeout fails stalled documents so the
+        in-flight table never leaks on GPU hang or worker crash.
         """
-        # {file_id: {pages, total, doc_job, session, started_at}}
         in_flight: dict[str, dict] = {}
         last_timeout_check = time.monotonic()
 
         while not self._shutdown.is_set():
             item = self._get(self._markdown_q, timeout=0.5)
 
-            # Periodic timeout sweep — every 30 s check for stalled documents
+            # Periodic timeout sweep every 30 s
             now = time.monotonic()
             if now - last_timeout_check > 30:
                 last_timeout_check = now
@@ -315,7 +355,7 @@ class StagePipeline:
                     if age > DOC_ASSEMBLY_TIMEOUT:
                         slot = in_flight.pop(fid)
                         logger.error(
-                            "[Assembler] '%s' timed out after %.0fs waiting for %d/%d pages",
+                            "[Assembler] '%s' timed out after %.0fs (%d/%d pages received)",
                             slot["doc_job"].filename, age,
                             len(slot["pages"]), slot["total"],
                         )
@@ -352,47 +392,51 @@ class StagePipeline:
 
             clean_md = self._cleaner.clean(raw_md)
             if not clean_md.strip():
-                logger.warning("[Assembler] '%s' produced empty OCR — using pypdf",
+                logger.warning("[Assembler] '%s' produced empty OCR — using pypdf fallback",
                                doc_job.filename)
-                clean_md = self._pypdf_fallback(doc_job.raw_bytes)
+                clean_md = self._pypdf_fallback(doc_job.file_path)
 
             if not clean_md.strip():
                 logger.error("[Assembler] '%s' — no text extracted", doc_job.filename)
                 self._fail(fid, session, "No text extracted from document")
-                doc_job.raw_bytes = b""   # Free memory even on failure
                 continue
 
-            # content_hash was set by the preprocess worker — no hashing here
-            content_hash = doc_job.content_hash or hashlib.sha256(doc_job.raw_bytes).hexdigest()
-
-            # SeaweedFS upload in a daemon thread — never blocks the assembler
+            # SeaweedFS upload: read bytes from disk (fast local read), then
+            # upload asynchronously in a daemon thread so the assembler is never
+            # blocked on network I/O.
             if self.storage:
                 self._store_seaweed_async(doc_job, raw_md, clean_md)
-
-            # Free the raw PDF bytes — no longer needed past this point
-            doc_job.raw_bytes = b""
 
             self._put(self._assembled_q, AssembledDoc(
                 file_id=fid, session_id=session,
                 markdown=clean_md, page_count=slot["total"],
-                content_hash=content_hash, doc_job=doc_job,
+                content_hash=doc_job.content_hash,
+                doc_job=doc_job,
             ))
             logger.info("[Assembler] '%s' assembled (%d pages, %d chars)",
                         doc_job.filename, slot["total"], len(clean_md))
 
-    def _pypdf_fallback(self, pdf_bytes: bytes) -> str:
+    def _pypdf_fallback(self, file_path: str) -> str:
         try:
             from pypdf import PdfReader
-            import io
-            reader = PdfReader(io.BytesIO(pdf_bytes))
+            reader = PdfReader(file_path)
             return "\n\n".join(p.extract_text() or "" for p in reader.pages)
         except Exception:
             return ""
 
     def _store_seaweed_async(self, doc_job: DocJob, raw_md: str, clean_md: str):
-        """Fire-and-forget SeaweedFS upload in a daemon thread."""
-        import asyncio, concurrent.futures
-        raw_bytes_copy = doc_job.raw_bytes   # Capture before raw_bytes is cleared
+        """
+        Read the PDF bytes from disk immediately (synchronous, fast local I/O),
+        then upload to SeaweedFS in a daemon thread.  Reading synchronously here
+        ensures the bytes are captured before the store_worker deletes the file.
+        """
+        import asyncio
+        try:
+            raw_bytes = Path(doc_job.file_path).read_bytes()
+        except Exception as e:
+            logger.warning("[SeaweedFS] Cannot read '%s' for upload: %s",
+                           doc_job.filename, e)
+            return
 
         def _run():
             loop = asyncio.new_event_loop()
@@ -400,7 +444,7 @@ class StagePipeline:
             try:
                 loop.run_until_complete(
                     self.storage.store_uploaded_pdf(
-                        doc_job.file_id, doc_job.filename, raw_bytes_copy))
+                        doc_job.file_id, doc_job.filename, raw_bytes))
                 loop.run_until_complete(
                     self.storage.store_extracted_text(
                         doc_job.file_id, doc_job.filename,
@@ -411,13 +455,17 @@ class StagePipeline:
             finally:
                 loop.close()
 
-        t = threading.Thread(target=_run, daemon=True,
-                             name=f"seaweed-{doc_job.file_id[:8]}")
-        t.start()
+        threading.Thread(target=_run, daemon=True,
+                         name=f"seaweed-{doc_job.file_id[:8]}").start()
 
     # ── Stage 5: Chunking ─────────────────────────────────────────────────────
 
     def _chunk_worker(self):
+        """
+        Creates a Postgres document record then emits ChunkItems.
+        Dedup is handled upstream in the preprocess worker — by the time a
+        document reaches here it is guaranteed to be new.
+        """
         while not self._shutdown.is_set():
             item = self._get(self._assembled_q)
             if item is None:
@@ -427,17 +475,9 @@ class StagePipeline:
                 self._update_stage(adoc.file_id, adoc.session_id, "chunking", 65)
 
                 if self.rbac:
-                    existing = self.rbac.find_doc_by_hash(
-                        adoc.content_hash, adoc.doc_job.dept_id)
-                    if existing:
-                        logger.info("[Chunk] '%s' duplicate — skipping", adoc.doc_job.filename)
-                        self._update_stage(adoc.file_id, adoc.session_id,
-                                           "done", 100, note="duplicate_skipped")
-                        continue
-
                     doc_id = self.rbac.create_document(
                         file_name=adoc.doc_job.filename,
-                        file_path=adoc.doc_job.filename,
+                        file_path=adoc.doc_job.file_path,
                         dept_id=adoc.doc_job.dept_id,
                         uploaded_by=adoc.doc_job.user_id,
                         content_hash=adoc.content_hash,
@@ -461,6 +501,7 @@ class StagePipeline:
                         "doc_id":     doc_id,
                         "doc_job":    adoc.doc_job,
                         "session_id": adoc.session_id,
+                        "content_hash": adoc.content_hash,
                     }
 
                 for idx, chunk in enumerate(raw_chunks):
@@ -529,10 +570,12 @@ class StagePipeline:
     def _store_worker(self):
         """
         Writes each chunk + embedding to PostgreSQL.
-        Uses a single lock acquisition to atomically read doc_id, detect
-        first-chunk, increment received, and detect completion — eliminating
-        the race condition where two threads could both see received==0.
-        Deletes the local upload file from disk when the document is fully stored.
+        Single lock acquisition atomically reads doc_id, detects first-chunk,
+        increments received, and detects completion — no TOCTOU race.
+
+        After a document is fully stored:
+        - Sets a 1-year Redis dedup key (fast-path for future re-uploads)
+        - Deletes the local upload file from disk
         """
         while not self._shutdown.is_set():
             item = self._get(self._store_q)
@@ -542,19 +585,25 @@ class StagePipeline:
             ci: ChunkItem    = ei.chunk_item
 
             # ── Atomically claim this chunk and detect state transitions ──────
-            doc_id      = None
-            first_chunk = False
-            done        = False
+            doc_id        = None
+            first_chunk   = False
+            done          = False
+            content_hash  = ""
+            doc_job_ref   = None
+            total_chunks  = 0
+
             with self._chunk_lock:
                 counter = self._chunk_counter.get(ci.file_id)
                 if counter is None:
                     continue   # Counter already removed — doc completed by another thread
-                doc_id      = counter["doc_id"]
-                first_chunk = counter["received"] == 0
+                doc_id       = counter["doc_id"]
+                first_chunk  = counter["received"] == 0
+                content_hash = counter.get("content_hash", "")
+                doc_job_ref  = counter["doc_job"]
                 counter["received"] += 1
                 rec   = counter["received"]
-                total = counter["total"]
-                done  = rec >= total
+                total_chunks = counter["total"]
+                done  = rec >= total_chunks
                 if done:
                     self._chunk_counter.pop(ci.file_id)
 
@@ -569,7 +618,7 @@ class StagePipeline:
                     chunk_id = self.rbac.add_chunk(
                         doc_id=doc_id, chunk_index=ci.chunk_idx,
                         chunk_text=ci.content,
-                        chunk_token_count=ci.token_count,   # Accurate tiktoken count
+                        chunk_token_count=ci.token_count,
                         page_num=ci.metadata.get("page", 0),
                         source_user_upload_id=u_id,
                         source_admin_upload_id=a_id,
@@ -595,30 +644,33 @@ class StagePipeline:
                         logger.warning("[Store] Status update failed for '%s': %s",
                                        ci.doc_job.filename, e)
 
-                self._update_stage(ci.file_id, ci.session_id, "done", 100)
-                logger.info("[Store] '%s' fully stored (%d chunks)", ci.doc_job.filename, total)
+                # Set 1-year Redis dedup key — future re-uploads hit the Redis
+                # fast-path in the preprocess worker without touching Postgres.
+                if self.rsm and content_hash:
+                    try:
+                        self.rsm.set_dedup(content_hash, doc_id)
+                    except Exception:
+                        pass
 
-                # Delete the local upload file — it has been processed and optionally
-                # uploaded to SeaweedFS.  Prevents unbounded disk growth at 500 docs/day.
-                try:
-                    upload_path = Path(ci.doc_job.filename)
-                    # doc_job.filename is just the basename; the actual path is in the
-                    # original job. We reconstruct it from the file_path stored at upload time.
-                    # The file path is stored in the upload record; use a best-effort delete
-                    # by looking in UPLOAD_DIR.
-                    from src.config import UPLOAD_DIR
-                    candidate = UPLOAD_DIR / f"{ci.file_id}_{upload_path.name}"
-                    if candidate.exists():
-                        candidate.unlink()
-                        logger.debug("[Store] Deleted upload file: %s", candidate)
-                except Exception as e:
-                    logger.warning("[Store] Could not delete upload file for '%s': %s",
-                                   ci.doc_job.filename, e)
+                self._update_stage(ci.file_id, ci.session_id, "done", 100)
+                logger.info("[Store] '%s' fully stored (%d chunks)",
+                            ci.doc_job.filename, total_chunks)
+
+                # Delete the local upload file — processed and optionally in SeaweedFS.
+                file_path = doc_job_ref.file_path if doc_job_ref else None
+                if file_path:
+                    try:
+                        fpath = Path(file_path)
+                        if fpath.exists():
+                            fpath.unlink()
+                            logger.debug("[Store] Deleted upload file: %s", fpath)
+                    except Exception as e:
+                        logger.warning("[Store] Could not delete '%s': %s", file_path, e)
 
     # ── Helpers ───────────────────────────────────────────────────────────────
 
     def _get(self, q: Queue, timeout: float = 2.0):
-        """Get from queue; return None on timeout or shutdown sentinel."""
+        """Get from queue; return None on shutdown sentinel or shutdown event."""
         while not self._shutdown.is_set():
             try:
                 item = q.get(timeout=timeout)
@@ -632,9 +684,9 @@ class StagePipeline:
     def _put(self, q: Queue, item, timeout: float = 1.0) -> bool:
         """
         Shutdown-aware put.  Loops until the item is enqueued or shutdown fires.
-        Returns True if enqueued, False if shutdown was signalled first.
-        This prevents any stage thread from blocking indefinitely on a full queue,
-        which would prevent clean shutdown and mask downstream bottlenecks.
+        Returns True if enqueued, False if shutdown was signalled.
+        Prevents any stage thread from blocking indefinitely on a full downstream
+        queue, which would deadlock shutdown and mask backpressure.
         """
         while not self._shutdown.is_set():
             try:
@@ -664,8 +716,14 @@ class StagePipeline:
             except Exception:
                 pass
 
-    def _update_global_stage(self, stage: str):
-        pass
+    def _skip(self, file_id: str, session_id: str, doc_id: str = ""):
+        """Mark a document as skipped (duplicate) without processing it."""
+        self._update_stage(file_id, session_id, "skipped", 100, doc_id=doc_id)
+        if self.rsm:
+            try:
+                self.rsm.incr_stat("total_skipped")
+            except Exception:
+                pass
 
     @staticmethod
     def _mps_available() -> bool:
