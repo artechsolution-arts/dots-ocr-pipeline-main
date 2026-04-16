@@ -1,167 +1,206 @@
-import logging, uvicorn, asyncio, os
+"""
+On-Prem RAG Ingestion Service
+==============================
+Starts the FastAPI app, connects to all infrastructure, and launches the
+worker pool for async PDF ingestion.
+
+Services initialised on startup
+--------------------------------
+1. PostgreSQL + pgvector  — chunk & embedding storage
+2. Redis                  — job state, SSE pub/sub, de-duplication fence
+3. RabbitMQ               — async job queue (priority / normal / large queues)
+4. SeaweedFS              — raw PDF + extracted markdown object storage
+5. WorkerPool             — consumes RabbitMQ jobs → runs IngestionOrchestrator
+"""
+
+import logging
+import uvicorn
+import asyncio
+import os
+from pathlib import Path
+
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse
+from fastapi.staticfiles import StaticFiles
 from contextlib import asynccontextmanager
 
 from src.config import cfg
-from src.database.postgres_db import get_pg_connection, create_schema, RBACManager
+from src.database.postgres_db import get_pg_pool, create_schema, RBACManager
 from src.database.redis_db import RedisStateManager
 from src.database.rabbitmq_broker import rabbit_connect, setup_topology
 from src.services.rag_pipeline import RAGPipeline
 from src.worker.pool import WorkerPool
 from src.api.routes import create_router
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logging.basicConfig(
+    level=getattr(logging, os.getenv("LOG_LEVEL", "INFO")),
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s",
+)
 logger = logging.getLogger(__name__)
 
-_pool_pg, _rsm, _mq_conn, _pipeline, _pool, _ids = None, None, None, None, None, {}
+_pool_pg  = None
+_rsm      = None
+_mq_conn  = None
+_pipeline = None
+_worker_pool = None
+_ids      = {}
 
-def seed_rbac(rbac: RBACManager):
-    """Ensures a system-level master user exists and creates sample data."""
+
+def _init_system_defaults(rbac: RBACManager) -> dict:
+    """
+    Ensure a System department and System user exist.
+    These are used as the default scope for uploads that don't specify dept_id/user_id.
+    Returns {"dept_default": <uuid>, "user_default": <uuid>}.
+    """
     ids = {}
-    
-    # 1. Create Default Department
+
+    # System department
     try:
-        dept_id = rbac.create_department("System", "Base System Department")
-        logger.info(f"Created System Department: {dept_id}")
+        dept_id = rbac.create_department("System", "Default system department")
     except Exception:
         cur = rbac.conn.cursor()
         cur.execute("SELECT id FROM departments WHERE name='System'")
-        res = cur.fetchone()
-        dept_id = str(res[0]) if res else None
-    
+        row = cur.fetchone()
+        dept_id = str(row[0]) if row else None
     ids["dept_default"] = dept_id
 
-    # 2. Create System User
+    # System user
     system_email = "system@internal.rag"
     try:
-        user_id = rbac.create_user(system_email, "System Master", "no_hash_required", dept_id, True)
-        logger.info(f"Created System User: {user_id}")
+        user_id = rbac.create_user(
+            system_email, "System", "no_hash_required", dept_id, is_super_admin=True
+        )
     except Exception:
         cur = rbac.conn.cursor()
         cur.execute("SELECT id FROM users WHERE email=%s", (system_email,))
-        res = cur.fetchone()
-        user_id = str(res[0]) if res else None
-
+        row = cur.fetchone()
+        user_id = str(row[0]) if row else None
     ids["user_default"] = user_id
 
-    # 3. Create sample departments and users for the UI
-    sample_depts = [
-        ("Administration", "Admin department"),
-        ("QA", "Quality Assurance"),
-        ("Plant", "Plant Operations"),
-        ("Marketing", "Marketing department"),
-        ("Sales", "Sales department"),
-    ]
-    sample_users = [
-        ("admin@rag.local", "Admin", "Administration", True),
-        ("qa@rag.local", "QA Specialist", "QA", False),
-        ("plant@rag.local", "Plant Manager", "Plant", False),
-        ("marketing@rag.local", "Marketing Lead", "Marketing", False),
-        ("sales@rag.local", "Sales Executive", "Sales", False),
-    ]
-    dept_map = {}
-    for name, desc in sample_depts:
-        try:
-            did = rbac.create_department(name, desc, None)
-            dept_map[name] = did
-            logger.info(f"Created dept '{name}': {did}")
-        except Exception as e:
-            logger.warning(f"Dept '{name}' already exists or error: {e}")
-            cur = rbac.conn.cursor()
-            cur.execute("SELECT id FROM departments WHERE name=%s", (name,))
-            res = cur.fetchone()
-            if res: dept_map[name] = str(res[0])
-    for email, uname, dept_name, is_admin in sample_users:
-        try:
-            did = dept_map.get(dept_name)
-            if did:
-                uid = rbac.create_user(email, uname, "hashed_pw", did, is_admin)
-                logger.info(f"Created user '{uname}': {uid}")
-        except Exception as e:
-            logger.warning(f"User '{uname}' already exists or error: {e}")
-
+    logger.info("System defaults — dept=%s user=%s", dept_id, user_id)
     return ids
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pool_pg, _rsm, _mq_conn, _pipeline, _pool, _ids
-    
-    # 1. Database & Schema
+    global _pool_pg, _rsm, _mq_conn, _pipeline, _worker_pool, _ids
+
+    # 1. PostgreSQL ─────────────────────────────────────────────────────────────
     try:
-        from src.database.postgres_db import get_pg_pool
         _pool_pg = get_pg_pool(minconn=1, maxconn=cfg.upload_workers + 5)
         conn = _pool_pg.getconn()
         conn.autocommit = True
         create_schema(conn)
-        _ids = seed_rbac(RBACManager(conn))
+        _ids = _init_system_defaults(RBACManager(conn))
         _pool_pg.putconn(conn)
-        logger.info(f"RBAC Seed IDs: {_ids}")
+        logger.info("PostgreSQL ready (pgvector schema applied)")
     except Exception as e:
-        logger.error(f"PostgreSQL failed: {e}")
+        logger.error("PostgreSQL init failed: %s", e)
 
-    # 2. Redis
+    # 2. Redis ──────────────────────────────────────────────────────────────────
     try:
         _rsm = RedisStateManager()
+        logger.info("Redis connected")
     except Exception as e:
-        logger.error(f"Redis failed: {e}")
+        logger.error("Redis init failed: %s", e)
 
-    # 3. RabbitMQ
+    # 3. RabbitMQ ───────────────────────────────────────────────────────────────
     try:
         _mq_conn = rabbit_connect()
         setup_topology(_mq_conn)
+        logger.info("RabbitMQ topology ready")
     except Exception as e:
-        logger.error(f"RabbitMQ failed: {e}")
+        logger.error("RabbitMQ init failed: %s", e)
 
-    # 4. SeaweedFS Object Storage
+    # 4. SeaweedFS (non-blocking — falls back gracefully if unavailable) ────────
+    _storage_service = None
     try:
         from src.storage import SeaweedFSClient, StorageService
         _sw_client = SeaweedFSClient(
-            filer_url=cfg.SEAWEEDFS_FILER_URL,
-            master_url=cfg.SEAWEEDFS_MASTER_URL,
+            endpoint_url=cfg.SEAWEEDFS_S3_ENDPOINT,
+            aws_access_key_id=cfg.SEAWEEDFS_ACCESS_KEY,
+            aws_secret_access_key=cfg.SEAWEEDFS_SECRET_KEY,
             bucket=cfg.SEAWEEDFS_BUCKET,
         )
         _storage_service = StorageService(_sw_client)
         app.state.storage_service = _storage_service
-        
-        # Non-blocking health check
-        async def _check():
+
+        async def _check_seaweedfs():
             try:
-                if await _sw_client.health_check():
-                    logger.info("SeaweedFS connected and healthy ✓")
+                ok = await _sw_client.health_check()
+                if ok:
+                    logger.info("SeaweedFS healthy")
                 else:
-                    logger.warning("SeaweedFS unreachable - using local fallback")
-            except Exception: logger.warning("SeaweedFS unreachable - using local fallback")
-        asyncio.create_task(_check())
+                    logger.warning("SeaweedFS unreachable — PDFs stored locally only")
+            except Exception:
+                logger.warning("SeaweedFS unreachable — PDFs stored locally only")
+
+        asyncio.create_task(_check_seaweedfs())
     except Exception as e:
-        logger.error(f"SeaweedFS initialization failed: {e}")
-        _storage_service = None
+        logger.warning("SeaweedFS init skipped: %s", e)
 
-    # 5. Pipeline & Router
+    # 5. Pipeline — start stage workers (always, even in api-only mode) ─────────
     _pipeline = RAGPipeline(_pool_pg, _rsm, storage=_storage_service)
-    app.include_router(create_router(_rsm, _ids, _pipeline, _mq_conn))
+    run_type  = os.getenv("RUN_TYPE", "worker")
 
-    # 6. Worker Pool (Only start in Worker containers, not API)
-    if _mq_conn and os.getenv("RUN_TYPE", "worker") == "worker":
-        _pool = WorkerPool(_rsm, _pipeline, cfg.upload_workers)
-        _pool.start()
-        logger.info("Workers initialized")
+    if run_type == "worker":
+        # Start all stage threads (preprocess, OCR, assemble, chunk, embed, store)
+        _pipeline.start()
+        logger.info("StagePipeline started (stage workers active)")
     else:
-        logger.info("Skipping WorkerPool initialization (RUN_TYPE is not 'worker')")
-    
-    yield
-    
-    if _pool: _pool.stop()
-    if _mq_conn: _mq_conn.close()
-    if _pool_pg: _pool_pg.closeall()
-    if hasattr(app.state, "storage_service"):
-        # Use simpler close to avoid event loop issues on exit
-        logger.info("Closing storage client...")
+        logger.info("API-only mode — stage workers NOT started (RUN_TYPE=%s)", run_type)
+
+    app.include_router(create_router(_rsm, _ids, _pipeline, _mq_conn))
+    logger.info("Ingestion pipeline ready")
+
+    # 6. RabbitMQ feeder pool (worker mode only) ─────────────────────────────
+    if _mq_conn and run_type == "worker":
+        # 3 feeders is enough to keep the _doc_q saturated; all heavy work
+        # happens inside StagePipeline stage threads, not in feeders.
+        _worker_pool = WorkerPool(_rsm, _pipeline, n=3)
+        _worker_pool.start()
+        logger.info("WorkerPool (RabbitMQ feeders) started")
+    else:
+        logger.info("Skipping RabbitMQ feeders (RUN_TYPE=%s)", run_type)
+
+    yield  # ── application runs ─────────────────────────────────────────────
+
+    # Shutdown
+    if _worker_pool:
+        _worker_pool.stop()
+    if run_type == "worker":
+        _pipeline.stop(timeout=30.0)
+    if _mq_conn:
+        _mq_conn.close()
+    if _pool_pg:
+        _pool_pg.closeall()
+    logger.info("Shutdown complete")
 
 
+app = FastAPI(
+    title="RAG Ingestion API",
+    description="On-prem document ingestion: PDF → OCR → Chunk → Embed → pgvector",
+    version="1.0.0",
+    lifespan=lifespan,
+)
 
-app = FastAPI(title="RAG PDF Pipeline", lifespan=lifespan)
-app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],   # Restrict to your query service origin in production
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+# ── Monitoring UI ──────────────────────────────────────────────────────────────
+_UI_FILE = Path(__file__).parent / "src" / "static" / "index.html"
+
+@app.get("/", response_class=HTMLResponse, include_in_schema=False)
+async def serve_ui():
+    """Serve the pipeline monitoring UI."""
+    if _UI_FILE.exists():
+        return HTMLResponse(_UI_FILE.read_text(encoding="utf-8"))
+    return HTMLResponse("<h2>UI not found — check src/static/index.html</h2>", status_code=404)
 
 if __name__ == "__main__":
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    uvicorn.run(app, host="0.0.0.0", port=8000, log_level="info")

@@ -91,6 +91,7 @@ class FileProgress:
             "doc_id":     self.doc_id,
             "error":      self.error,
             "retry":      self.retry,
+            "started_at": self.started_at,
             "duration":   self.duration,
         }
 

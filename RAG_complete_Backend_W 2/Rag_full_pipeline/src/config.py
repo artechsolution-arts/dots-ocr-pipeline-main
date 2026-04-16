@@ -60,9 +60,11 @@ MAX_RETRIES   = 3
 class RAGConfig:
     def __init__(self):
         # Embedding
-        self.embedding_model:      str   = EMBEDDING_MODEL
+        self.embedding_model:      str   = os.getenv("EMBEDDING_MODEL", EMBEDDING_MODEL)
         self.embedding_dim:        int   = EMBEDDING_DIM
-        self.embedding_batch:      int   = 32
+        # Batch size: 128 is optimal for M3 Ultra CPU (512 GB RAM).
+        # Lower to 32-64 on memory-constrained machines.
+        self.embedding_batch:      int   = int(os.getenv("EMBEDDING_BATCH_SIZE", "128"))
         self.embedding_device:     str   = os.getenv("EMBEDDING_DEVICE", "cpu")
         self.upload_dir:           Path  = UPLOAD_DIR
         # Chunking
@@ -86,6 +88,9 @@ class RAGConfig:
         # OCR
         self.ocr_dpi:              int   = 400
         self.ocr_fallback:         bool  = True
+        # Device for OCR: DotsOCR auto-detects via torch.backends.mps.is_available()
+        # so this setting is informational only (shown in logs).
+        self.ocr_device:           str   = os.getenv("OCR_DEVICE", "auto")
         # DotsOCR (VLM Engine) — read from env so Docker service names resolve
         self.dots_ocr_ip:          str   = os.getenv("DOTS_OCR_IP",   "localhost")
         self.dots_ocr_port:        int   = int(os.getenv("DOTS_OCR_PORT", "8001"))

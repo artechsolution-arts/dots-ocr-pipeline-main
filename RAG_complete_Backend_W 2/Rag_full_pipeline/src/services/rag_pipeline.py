@@ -1,18 +1,38 @@
-import logging, time, threading
-from src.config import cfg
+"""
+RAG Pipeline  —  ingestion facade
+==================================
+Wraps StagePipeline.  All processing happens inside the stage workers;
+this class is only responsible for initialisation and the public submit API.
+
+Architecture
+------------
+  routes.py / PDFWorker
+       │
+       ▼
+  RAGPipeline.submit(DocJob)
+       │
+       ▼
+  StagePipeline._doc_q
+       │
+       ▼  (stage workers: preprocess → ocr → assemble → chunk → embed → store)
+  PostgreSQL + pgvector
+"""
+
+import logging
+
 from src.database.postgres_db import RBACManager
-from src.ingestion.orchestrator import IngestionOrchestrator
+from src.ingestion.pipeline.datatypes import DocJob
+from src.ingestion.pipeline.stage_pipeline import StagePipeline
 
 logger = logging.getLogger(__name__)
 
 
 class RAGPipeline:
     """
-    RAG Ingestion Pipeline.
+    Public facade for the ingestion pipeline.
 
-    Scope  : PDF → DotsOCR → Text Cleaning → Chunking → Embedding
-              → store chunks + vectors in PostgreSQL (pgvector).
-    Chat / retrieval are out of scope for this container.
+    Holds shared infrastructure references (DB pool, Redis, SeaweedFS) and
+    owns a StagePipeline that contains all processing threads.
     """
 
     def __init__(self, conn, rsm, storage=None):
@@ -20,23 +40,35 @@ class RAGPipeline:
         self.rsm     = rsm
         self.storage = storage
         self.rbac    = RBACManager(conn)
-        self._orchestrator = None # Lazy loaded
-        self._lock = threading.Lock()
-        logger.info("RAGPipeline (ingestion-only) initialised.")
 
-    @property
-    def orchestrator(self):
-        with self._lock:
-            if self._orchestrator is None:
-                from src.ingestion.orchestrator import IngestionOrchestrator
-                self._orchestrator = IngestionOrchestrator(
-                    rsm=self.rsm, rbac=self.rbac, storage=self.storage
-                )
-        return self._orchestrator
+        # StagePipeline is created here but started externally via start()
+        self._stage_pipeline = StagePipeline(
+            rsm=rsm,
+            rbac=self.rbac,
+            storage=storage,
+        )
+        logger.info("RAGPipeline (stage-based ingestion) initialised.")
 
-    # ─────────────────────────────────────────────────────────────────────────
-    # INGESTION  — called by the WorkerPool (PDFWorker._on_message)
-    # ─────────────────────────────────────────────────────────────────────────
+    # ── Lifecycle ─────────────────────────────────────────────────────────────
+
+    def start(self):
+        """Start all stage worker threads."""
+        self._stage_pipeline.start()
+        logger.info("StagePipeline started")
+
+    def stop(self, timeout: float = 30.0):
+        """Graceful shutdown — drain queues then stop threads."""
+        self._stage_pipeline.stop(timeout=timeout)
+        logger.info("StagePipeline stopped")
+
+    # ── Public API ────────────────────────────────────────────────────────────
+
+    def submit(self, doc_job: DocJob):
+        """
+        Submit a document into the stage pipeline.
+        Returns immediately — processing is async through the stage queues.
+        """
+        self._stage_pipeline.submit(doc_job)
 
     def process_pdf(
         self,
@@ -48,48 +80,22 @@ class RAGPipeline:
         session_id:  str,
         upload_type: str = "user",
         upload_id:   str = None,
-        **kwargs,          # absorbs chat_id / retry passed by worker
+        **kwargs,
     ):
         """
-        Execute the modular ingestion flow:
-          1. Validation + dedup check
-          2. DotsOCR extraction
-          3. Text cleaning
-          4. Chunking (Markdown-aware, token-aware)
-          5. Embedding (sentence-transformers / mxbai-embed-large)
-          6. Persist chunks + embeddings → PostgreSQL / pgvector
-          7. Persist raw PDF → SeaweedFS  (if storage service available)
+        Convenience wrapper used by PDFWorker.
+        Creates a DocJob and submits it to the stage pipeline.
         """
-        logger.info(f"[Pipeline] Ingesting: {filename} ({len(raw_bytes)//1024} KB)")
-        t0 = time.time()
-
-        result = self.orchestrator.run_ingestion(
-            raw_bytes=raw_bytes,
-            filename=filename,
-            user_id=user_id,
-            dept_id=dept_id,
+        doc_job = DocJob(
             file_id=file_id,
             session_id=session_id,
-            upload_type=upload_type,
+            filename=filename,
+            raw_bytes=raw_bytes,
+            user_id=user_id,
+            dept_id=dept_id,
             upload_id=upload_id,
+            upload_type=upload_type,
         )
-
-        latency = round(time.time() - t0, 2)
-        logger.info(
-            f"[Pipeline] {filename} → {result.stage} "
-            f"| chunks={result.chunks} | {latency}s"
-        )
-        return result
-
-    # ─────────────────────────────────────────────────────────────────────────
-    # STUB — keeps routes.py from crashing if /query is hit
-    # ─────────────────────────────────────────────────────────────────────────
-
-    def query(self, question, user_id, dept_id, chat_id, search="hybrid"):
-        return {
-            "answer": (
-                "Query/chat endpoint is disabled in this deployment. "
-                "This container handles document ingestion only."
-            ),
-            "citations": [],
-        }
+        self.submit(doc_job)
+        logger.info("[Pipeline] Submitted '%s' (%d KB) to stage pipeline",
+                    filename, len(raw_bytes) // 1024)

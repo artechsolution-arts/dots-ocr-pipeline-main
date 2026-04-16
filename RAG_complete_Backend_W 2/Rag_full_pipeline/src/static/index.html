@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>RAG Pipeline Monitor</title>
+<style>
+:root {
+  --bg:           #07071a;
+  --surface:      #0d0d22;
+  --surface2:     #121230;
+  --border:       #1c1c3a;
+  --border2:      #252550;
+  --text:         #e2e8f0;
+  --text2:        #8892a8;
+  --text3:        #404060;
+  --accent:       #6366f1;
+  --accent2:      #818cf8;
+  --accent-bg:    rgba(99,102,241,.08);
+  --accent-bdr:   rgba(99,102,241,.30);
+  --success:      #10b981;
+  --success-bg:   rgba(16,185,129,.08);
+  --success-bdr:  rgba(16,185,129,.30);
+  --warn:         #f59e0b;
+  --warn-bg:      rgba(245,158,11,.08);
+  --warn-bdr:     rgba(245,158,11,.30);
+  --error:        #ef4444;
+  --error-bg:     rgba(239,68,68,.08);
+  --error-bdr:    rgba(239,68,68,.30);
+}
+
+*{box-sizing:border-box;margin:0;padding:0}
+body{font-family:-apple-system,BlinkMacSystemFont,'Inter','Segoe UI',sans-serif;
+  background:var(--bg);color:var(--text);min-height:100vh;font-size:14px;line-height:1.5}
+
+/* ── Header ─────────────────────────────────────────────────────────────────── */
+.hdr{position:sticky;top:0;z-index:100;
+  display:flex;align-items:center;justify-content:space-between;
+  padding:0 28px;height:56px;
+  background:rgba(13,13,34,.9);border-bottom:1px solid var(--border);
+  backdrop-filter:blur(12px)}
+
+.logo{display:flex;align-items:center;gap:10px;font-size:15px;font-weight:700;letter-spacing:-.02em}
+.logo-ring{width:28px;height:28px;border-radius:8px;
+  background:linear-gradient(135deg,var(--accent),#a855f7);
+  display:flex;align-items:center;justify-content:center;font-size:14px}
+
+.hdr-right{display:flex;align-items:center;gap:12px}
+
+.health-pill{display:flex;align-items:center;gap:7px;
+  font-size:12px;color:var(--text2);
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:20px;padding:5px 13px;cursor:pointer;transition:.2s}
+.health-pill:hover{border-color:var(--border2)}
+.h-dot{width:7px;height:7px;border-radius:50%;background:var(--text3);transition:.3s}
+.h-dot.ok{background:var(--success);box-shadow:0 0 7px var(--success)}
+.h-dot.deg{background:var(--warn)}
+.h-dot.err{background:var(--error)}
+
+.stats-pill{font-size:12px;color:var(--text3);
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:20px;padding:5px 13px}
+.stats-pill b{color:var(--text2)}
+
+/* ── Layout ──────────────────────────────────────────────────────────────────── */
+.wrap{max-width:860px;margin:0 auto;padding:32px 24px}
+
+/* ── Upload zone ─────────────────────────────────────────────────────────────── */
+.drop-zone{
+  background:var(--surface);border:2px dashed var(--border);
+  border-radius:18px;padding:52px 24px;text-align:center;
+  cursor:pointer;transition:.2s;margin-bottom:32px;position:relative}
+.drop-zone:hover,.drop-zone.over{
+  border-color:var(--accent);background:var(--accent-bg)}
+.drop-zone input[type=file]{
+  position:absolute;inset:0;opacity:0;width:100%;height:100%;cursor:pointer}
+
+.dz-icon{font-size:40px;margin-bottom:14px;transition:.2s}
+.drop-zone.over .dz-icon{transform:scale(1.15)}
+.dz-title{font-size:17px;font-weight:700;margin-bottom:6px}
+.dz-sub{font-size:13px;color:var(--text2);margin-bottom:22px}
+.dz-btn{
+  display:inline-block;background:var(--accent);color:#fff;
+  border:none;border-radius:9px;padding:10px 24px;
+  font-size:13px;font-weight:600;cursor:pointer;transition:.15s;
+  pointer-events:none;letter-spacing:.01em}
+.drop-zone:hover .dz-btn{background:var(--accent2)}
+
+.dz-busy{display:none;margin-top:20px;height:4px;
+  background:var(--border);border-radius:4px;overflow:hidden}
+.dz-busy.on{display:block}
+.dz-busy-bar{height:100%;width:35%;background:var(--accent);
+  border-radius:4px;animation:slide 1.1s ease-in-out infinite}
+@keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(350%)}}
+
+/* ── Sessions ────────────────────────────────────────────────────────────────── */
+.sec-label{font-size:11px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.1em;color:var(--text3);margin-bottom:14px}
+
+.empty{text-align:center;color:var(--text3);padding:56px 0;font-size:13px}
+
+/* ── Session card ────────────────────────────────────────────────────────────── */
+.sess{background:var(--surface);border:1px solid var(--border);
+  border-radius:14px;margin-bottom:22px;overflow:hidden}
+
+.sess-hdr{
+  display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+  padding:13px 20px;background:var(--surface2);border-bottom:1px solid var(--border)}
+.sess-id{
+  font-family:'SF Mono','Fira Code',monospace;font-size:11px;
+  color:var(--accent);background:var(--accent-bg);
+  border:1px solid var(--accent-bdr);border-radius:5px;padding:2px 8px}
+.sess-meta{font-size:12px;color:var(--text2)}
+.sess-pill{
+  margin-left:auto;font-size:11px;font-weight:700;
+  padding:3px 11px;border-radius:12px;text-transform:uppercase;letter-spacing:.06em}
+.sess-pill.run{background:var(--accent-bg);color:var(--accent2);border:1px solid var(--accent-bdr)}
+.sess-pill.ok {background:var(--success-bg);color:var(--success);border:1px solid var(--success-bdr)}
+.sess-pill.err{background:var(--error-bg);color:var(--error);border:1px solid var(--error-bdr)}
+
+.sess-files{padding:12px;display:flex;flex-direction:column;gap:10px}
+
+.sess-footer{
+  display:none;padding:10px 20px;
+  background:var(--surface2);border-top:1px solid var(--border);
+  gap:18px;font-size:12px;color:var(--text2);flex-wrap:wrap}
+.sess-footer.on{display:flex}
+.sess-footer b{color:var(--text)}
+
+/* ── File card ───────────────────────────────────────────────────────────────── */
+.fcard{
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:11px;padding:18px;transition:border-color .2s}
+.fcard.run {border-color:var(--accent-bdr)}
+.fcard.done{border-color:var(--success-bdr)}
+.fcard.err {border-color:var(--error-bdr)}
+.fcard.skip{border-color:var(--warn-bdr)}
+
+.fcard-top{display:flex;align-items:flex-start;gap:11px;margin-bottom:15px}
+.fcard-icon{font-size:20px;flex-shrink:0;margin-top:1px}
+.fcard-info{flex:1;min-width:0}
+.fcard-name{
+  font-size:14px;font-weight:700;white-space:nowrap;
+  overflow:hidden;text-overflow:ellipsis;margin-bottom:4px}
+.fcard-meta{display:flex;gap:14px;font-size:12px;color:var(--text2);flex-wrap:wrap}
+
+.fcard-timing{text-align:right;flex-shrink:0}
+.fcard-stage{font-size:11px;font-weight:700;text-transform:uppercase;
+  letter-spacing:.06em;margin-bottom:5px}
+.fcard-timer{
+  font-family:'SF Mono','Fira Code',monospace;
+  font-size:22px;font-weight:800;letter-spacing:-.03em}
+.fcard-timer.run {color:var(--text)}
+.fcard-timer.done{color:var(--success)}
+.fcard-timer.err {color:var(--error)}
+
+/* Progress bar */
+.pbar{background:var(--border);border-radius:5px;height:5px;
+  margin-bottom:18px;overflow:hidden}
+.pbar-fill{height:100%;border-radius:5px;transition:width .5s ease;
+  background:linear-gradient(90deg,var(--accent),var(--accent2))}
+.pbar-fill.done{background:linear-gradient(90deg,var(--success),#34d399)}
+.pbar-fill.err{background:var(--error);width:100%!important}
+
+/* Stage pipeline */
+.pipeline{
+  display:flex;align-items:flex-start;
+  margin-bottom:15px;overflow-x:auto;padding-bottom:2px;
+  scrollbar-width:thin;scrollbar-color:var(--border) transparent}
+.pipeline::-webkit-scrollbar{height:3px}
+.pipeline::-webkit-scrollbar-thumb{background:var(--border);border-radius:2px}
+
+.ps{display:flex;flex-direction:column;align-items:center;
+  flex:1;min-width:52px;position:relative}
+
+/* Connector line between dots */
+.ps::after{
+  content:'';position:absolute;top:10px;
+  left:calc(50% + 11px);right:calc(-50% + 11px);
+  height:2px;background:var(--border);z-index:0;transition:.3s}
+.ps:last-child::after{display:none}
+.ps.pdone::after {background:var(--success)}
+.ps.pactive::after{background:var(--accent)}
+
+.ps-dot{
+  width:22px;height:22px;border-radius:50%;z-index:1;
+  border:2px solid var(--border);background:var(--surface);
+  display:flex;align-items:center;justify-content:center;
+  font-size:9px;font-weight:700;margin-bottom:7px;transition:.25s}
+.ps-dot.pdone {background:var(--success);border-color:var(--success);color:#fff}
+.ps-dot.pactive{background:var(--accent);border-color:var(--accent);color:#fff;
+  box-shadow:0 0 12px rgba(99,102,241,.55);
+  animation:pdot 1.6s ease-in-out infinite}
+.ps-dot.perr  {background:var(--error);border-color:var(--error);color:#fff}
+@keyframes pdot{
+  0%,100%{box-shadow:0 0 0 0 rgba(99,102,241,.6)}
+  50%{box-shadow:0 0 0 6px rgba(99,102,241,0)}}
+
+.ps-lbl{font-size:10px;text-align:center;white-space:nowrap;
+  color:var(--text3);font-weight:500;transition:.2s}
+.ps-lbl.pdone {color:var(--success)}
+.ps-lbl.pactive{color:var(--accent2);font-weight:700}
+.ps-lbl.perr  {color:var(--error)}
+
+/* Stats row */
+.fcard-stats{display:flex;gap:18px;flex-wrap:wrap;font-size:12px;color:var(--text2)}
+.fstat{display:flex;align-items:center;gap:5px}
+.fstat-v{font-weight:700;font-size:13px;color:var(--text);
+  font-family:'SF Mono','Fira Code',monospace}
+
+.fcard-err-msg{
+  margin-top:11px;padding:9px 13px;
+  background:var(--error-bg);border:1px solid var(--error-bdr);
+  border-radius:7px;font-size:12px;color:var(--error);
+  font-family:'SF Mono','Fira Code',monospace;word-break:break-all}
+
+/* Stage timing breakdown */
+.stage-times{
+  margin-top:12px;padding:10px 13px;
+  background:rgba(0,0,0,.2);border:1px solid var(--border);
+  border-radius:8px;display:flex;gap:10px;flex-wrap:wrap}
+.st-item{font-size:11px;color:var(--text2)}
+.st-item b{color:var(--text);font-family:'SF Mono','Fira Code',monospace}
+
+/* ── Toast ───────────────────────────────────────────────────────────────────── */
+.toasts{position:fixed;bottom:24px;right:24px;
+  display:flex;flex-direction:column;gap:8px;z-index:999}
+.toast{
+  background:var(--surface2);border:1px solid var(--border);
+  border-radius:9px;padding:12px 16px;font-size:13px;
+  box-shadow:0 6px 24px rgba(0,0,0,.5);max-width:320px;
+  animation:tin .2s ease;display:flex;align-items:flex-start;gap:9px}
+.toast.ok {border-color:var(--success-bdr)}
+.toast.err{border-color:var(--error-bdr)}
+@keyframes tin{from{transform:translateY(8px);opacity:0}to{transform:translateY(0);opacity:1}}
+</style>
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────────────────────── -->
+<header class="hdr">
+  <div class="logo">
+    <div class="logo-ring">⚙</div>
+    RAG Pipeline Monitor
+  </div>
+  <div class="hdr-right">
+    <div class="stats-pill" id="globalStats">—</div>
+    <div class="health-pill" id="healthPill" onclick="checkHealth()" title="Click to refresh">
+      <div class="h-dot" id="hDot"></div>
+      <span id="hText">Checking…</span>
+    </div>
+  </div>
+</header>
+
+<!-- ── Main ────────────────────────────────────────────────────────────────── -->
+<main class="wrap">
+
+  <!-- Upload zone -->
+  <div class="drop-zone" id="dropZone">
+    <input type="file" id="fileInput" accept=".pdf" multiple>
+    <div class="dz-icon">📤</div>
+    <div class="dz-title">Drop PDF files here</div>
+    <div class="dz-sub">or click anywhere to browse · multiple files supported</div>
+    <div class="dz-btn">Choose Files</div>
+    <div class="dz-busy" id="dzBusy"><div class="dz-busy-bar"></div></div>
+  </div>
+
+  <!-- Sessions list -->
+  <div id="secLabel" class="sec-label" style="display:none">Recent Sessions</div>
+  <div id="sessRoot">
+    <div class="empty" id="emptyMsg">No sessions yet — upload a PDF to start</div>
+  </div>
+
+</main>
+
+<div class="toasts" id="toasts"></div>
+
+<script>
+'use strict';
+
+// ─── Stage definitions (must match stage_pipeline.py update_stage calls) ─────
+const STAGES = [
+  { id:'queued',        label:'Queued'    },
+  { id:'preprocessing', label:'Preprocess'},
+  { id:'ocr',           label:'OCR'       },
+  { id:'assembling',    label:'Assemble'  },
+  { id:'chunking',      label:'Chunk'     },
+  { id:'embedding',     label:'Embed'     },
+  { id:'storing',       label:'Store'     },
+  { id:'done',          label:'Done'      },
+];
+const SIDX = Object.fromEntries(STAGES.map((s,i)=>[s.id,i]));
+// skipped maps to done visually
+SIDX['skipped'] = 7;
+const TERMINAL = new Set(['done','error','skipped']);
+
+// ─── State ───────────────────────────────────────────────────────────────────
+const sessions = {};   // sessionId → {files:{}, el, createdAt, total}
+const timers   = {};   // fileId → {startMs, iv}
+let totalProcessed = 0, totalErrors = 0;
+
+// ─── Health check ─────────────────────────────────────────────────────────────
+async function checkHealth(){
+  const dot = document.getElementById('hDot');
+  const txt = document.getElementById('hText');
+  try{
+    const r = await fetch('/health');
+    const d = await r.json();
+    const ok = d.postgres && d.redis && d.rabbitmq;
+    dot.className = 'h-dot ' + (ok ? 'ok' : 'deg');
+    const bad = [];
+    if(!d.postgres)  bad.push('PG');
+    if(!d.redis)     bad.push('Redis');
+    if(!d.rabbitmq)  bad.push('RabbitMQ');
+    txt.textContent = ok ? 'All Systems Online' : 'Degraded: '+bad.join(', ');
+  } catch{
+    dot.className='h-dot err';
+    txt.textContent='API Offline';
+  }
+}
+checkHealth();
+setInterval(checkHealth, 15000);
+
+function updateGlobalStats(){
+  const el = document.getElementById('globalStats');
+  el.innerHTML = `<b>${totalProcessed}</b> done &nbsp;·&nbsp; <b>${totalErrors}</b> errors`;
+}
+updateGlobalStats();
+
+// ─── Drag & Drop ─────────────────────────────────────────────────────────────
+const dz = document.getElementById('dropZone');
+dz.addEventListener('dragover', e=>{e.preventDefault();dz.classList.add('over')});
+['dragleave','dragend'].forEach(ev=>dz.addEventListener(ev,()=>dz.classList.remove('over')));
+dz.addEventListener('drop', e=>{
+  e.preventDefault(); dz.classList.remove('over');
+  const files=[...e.dataTransfer.files].filter(f=>f.name.toLowerCase().endsWith('.pdf'));
+  if(files.length) uploadFiles(files);
+  else showToast('⚠ Only PDF files are accepted','err');
+});
+document.getElementById('fileInput').addEventListener('change', e=>{
+  if(e.target.files.length){ uploadFiles([...e.target.files]); e.target.value=''; }
+});
+
+// ─── Upload ───────────────────────────────────────────────────────────────────
+async function uploadFiles(files){
+  const busy = document.getElementById('dzBusy');
+  busy.classList.add('on');
+  dz.style.pointerEvents='none';
+  try{
+    const fd = new FormData();
+    files.forEach(f=>fd.append('files',f));
+    const resp = await fetch('/ingest',{method:'POST',body:fd});
+    if(!resp.ok){
+      const e = await resp.json().catch(()=>({detail:resp.statusText}));
+      throw new Error(e.detail||'Upload failed ('+resp.status+')');
+    }
+    const data = await resp.json();
+    const n = files.length;
+    showToast(`✅  ${n} file${n>1?'s':''} queued for ingestion`,'ok');
+    createSessionUI(data.session_id, data.files, data.dept_id);
+    connectSSE(data.session_id);
+  } catch(e){
+    showToast('Upload failed: '+e.message,'err');
+  } finally{
+    busy.classList.remove('on');
+    dz.style.pointerEvents='';
+  }
+}
+
+// ─── Session UI ───────────────────────────────────────────────────────────────
+function createSessionUI(sid, files, deptId){
+  document.getElementById('emptyMsg').style.display='none';
+  document.getElementById('secLabel').style.display='';
+
+  const root = document.getElementById('sessRoot');
+  const now  = new Date().toLocaleString();
+  const shortId = sid.slice(0,8);
+  const n = files.length;
+
+  const el = document.createElement('div');
+  el.className='sess'; el.id='sess-'+sid;
+  el.innerHTML = `
+    <div class="sess-hdr">
+      <span class="sess-id">${shortId}</span>
+      <span class="sess-meta">${now} · ${n} file${n>1?'s':''}</span>
+      <span class="sess-pill run" id="spill-${sid}">Processing</span>
+    </div>
+    <div class="sess-files" id="sfiles-${sid}"></div>
+    <div class="sess-footer" id="sfooter-${sid}"></div>
+  `;
+  root.insertBefore(el, root.firstChild);
+
+  sessions[sid]={files:{},el,createdAt:Date.now(),total:n,done:0,errors:0};
+
+  files.forEach(f=>addFileCard(sid, f.file_id, f.filename, f.size_kb));
+}
+
+function addFileCard(sid, fid, filename, sizeKb){
+  sessions[sid].files[fid] = {stage:'queued',pct:0,pages:0,chunks:0,filename,sizeKb,startMs:Date.now()};
+  const el = document.createElement('div');
+  el.className='fcard'; el.id='fcard-'+fid;
+  el.innerHTML = renderCard(fid, sessions[sid].files[fid]);
+  document.getElementById('sfiles-'+sid).appendChild(el);
+  startTimer(fid, sessions[sid].files[fid].startMs);
+}
+
+// ─── Card renderer ────────────────────────────────────────────────────────────
+function renderCard(fid, f){
+  const isDone  = f.stage==='done'||f.stage==='skipped';
+  const isErr   = f.stage==='error';
+  const isSkip  = f.stage==='skipped';
+  const isRun   = !TERMINAL.has(f.stage);
+  const stageLabel = isSkip?'Skipped (dup)': f.stage.charAt(0).toUpperCase()+f.stage.slice(1);
+
+  // Timer display
+  let timerTxt, timerCls;
+  if(isDone||isErr){
+    stopTimer(fid);
+    timerTxt = f.duration!=null ? fmtDur(f.duration) : (timers[fid]? fmtMs(Date.now()-timers[fid].startMs): '—');
+    timerCls = isDone?'done':'err';
+  } else {
+    const ms = timers[fid] ? Date.now()-timers[fid].startMs : Date.now()-f.startMs;
+    timerTxt = fmtMs(ms);
+    timerCls = 'run';
+  }
+
+  const stageColor = isDone?'var(--success)':isErr?'var(--error)':'var(--accent2)';
+  const pct2 = isErr?100:f.pct;
+  const fillCls = isDone?'done':isErr?'err':'';
+  const sizeMb = ((f.sizeKb||0)/1024).toFixed(1);
+
+  return `
+<div class="fcard-top">
+  <div class="fcard-icon">📄</div>
+  <div class="fcard-info">
+    <div class="fcard-name" title="${esc(f.filename)}">${esc(f.filename)}</div>
+    <div class="fcard-meta">
+      <span>${sizeMb} MB</span>
+      ${f.pages>0?`<span>${f.pages} pages</span>`:''}
+      ${f.chunks>0?`<span>${f.chunks} chunks</span>`:''}
+    </div>
+  </div>
+  <div class="fcard-timing">
+    <div class="fcard-stage" style="color:${stageColor}">${stageLabel}</div>
+    <div class="fcard-timer ${timerCls}" id="timer-${fid}">${timerTxt}</div>
+  </div>
+</div>
+<div class="pbar"><div class="pbar-fill ${fillCls}" style="width:${pct2}%"></div></div>
+${renderPipeline(f.stage)}
+<div class="fcard-stats">
+  <div class="fstat">📄 <span class="fstat-v" id="fp-${fid}">${f.pages||'—'}</span> pages</div>
+  <div class="fstat">✂️ <span class="fstat-v" id="fc-${fid}">${f.chunks||'—'}</span> chunks</div>
+  <div class="fstat">📦 <span>${sizeMb} MB</span></div>
+  ${f.duration!=null?`<div class="fstat">⏱ <span class="fstat-v">${fmtDur(f.duration)}</span> total</div>`:''}
+</div>
+${f.error?`<div class="fcard-err-msg">⚠ ${esc(f.error)}</div>`:''}
+`;
+}
+
+// ─── Pipeline dots ────────────────────────────────────────────────────────────
+function renderPipeline(stage){
+  const isErr  = stage==='error';
+  const curIdx = isErr ? -1 : (SIDX[stage]??0);
+  const allDone= stage==='done'||stage==='skipped';
+
+  let html='<div class="pipeline">';
+  STAGES.forEach((s,i)=>{
+    let pc='', lc='', dc='', dot='';
+    if(isErr){
+      // everything grey, no highlighting
+    } else if(allDone || i<curIdx){
+      dc='pdone'; lc='pdone'; pc='pdone'; dot='✓';
+    } else if(i===curIdx){
+      dc='pactive'; lc='pactive';
+      if(i<STAGES.length-1) pc='pactive';
+    }
+    html+=`<div class="ps ${pc}">
+  <div class="ps-dot ${dc}">${dot}</div>
+  <div class="ps-lbl ${lc}">${s.label}</div>
+</div>`;
+  });
+  return html+'</div>';
+}
+
+// ─── SSE ──────────────────────────────────────────────────────────────────────
+function connectSSE(sid){
+  const es = new EventSource(`/ingest/progress/${sid}`);
+  if(sessions[sid]) sessions[sid].es=es;
+
+  es.onmessage = e => {
+    try{
+      const ev = JSON.parse(e.data);
+      if(ev.type==='file_progress')   onFileProgress(sid, ev.data);
+      else if(ev.type==='session_complete') onSessionDone(sid, ev.data, es);
+    } catch(err){ console.error('SSE parse:',err); }
+  };
+  es.onerror = () => { /* browser auto-reconnects */ };
+}
+
+function onFileProgress(sid, d){
+  const sess = sessions[sid]; if(!sess) return;
+  const f    = sess.files[d.file_id]; if(!f) return;
+
+  // Merge state
+  f.stage    = d.stage;
+  f.pct      = d.pct;
+  f.pages    = d.pages  || f.pages;
+  f.chunks   = d.chunks || f.chunks;
+  f.duration = d.duration;
+  if(d.started_at && !f.serverStart) f.serverStart = d.started_at;
+
+  // Rebuild card
+  const el = document.getElementById('fcard-'+d.file_id); if(!el) return;
+  el.innerHTML = renderCard(d.file_id, f);
+  el.className = 'fcard ' + (
+    d.stage==='done'||d.stage==='skipped' ? 'done' :
+    d.stage==='error' ? 'err' : 'run'
+  );
+
+  // Timer
+  if(TERMINAL.has(d.stage)){
+    stopTimer(d.file_id);
+  } else {
+    ensureTimer(d.file_id, f.startMs);
+  }
+}
+
+function onSessionDone(sid, d, es){
+  es.close();
+  const sess = sessions[sid]; if(sess) sess.es=null;
+
+  const pill = document.getElementById('spill-'+sid);
+  if(pill){
+    const hasErr = d.errors>0;
+    pill.className='sess-pill '+(hasErr?'err':'ok');
+    pill.textContent = hasErr ? `${d.errors} Error${d.errors>1?'s':''}` : 'Complete';
+  }
+
+  const footer = document.getElementById('sfooter-'+sid);
+  if(footer){
+    const totalTime = sess ? fmtMs(Date.now()-sess.createdAt) : '';
+    footer.innerHTML=`
+      <span>✅ <b>${d.done}</b> done</span>
+      ${d.errors>0?`<span>❌ <b>${d.errors}</b> error${d.errors>1?'s':''}</span>`:''}
+      ${d.skipped>0?`<span>⏭ <b>${d.skipped}</b> skipped</span>`:''}
+      <span>✂️ <b>${d.total_chunks||0}</b> total chunks</span>
+      ${totalTime?`<span>⏱ Session: <b>${totalTime}</b></span>`:''}
+    `;
+    footer.classList.add('on');
+  }
+
+  totalProcessed += d.done||0;
+  totalErrors    += d.errors||0;
+  updateGlobalStats();
+}
+
+// ─── Timer ────────────────────────────────────────────────────────────────────
+function startTimer(fid, startMs){
+  if(timers[fid]) return;
+  const iv = setInterval(()=>{
+    const el = document.getElementById('timer-'+fid);
+    if(el && !el.classList.contains('done') && !el.classList.contains('err')){
+      el.textContent = fmtMs(Date.now()-startMs);
+    }
+  }, 500);
+  timers[fid] = {startMs, iv};
+}
+
+function ensureTimer(fid, startMs){
+  if(!timers[fid]) startTimer(fid, startMs||Date.now());
+}
+
+function stopTimer(fid){
+  if(timers[fid]){ clearInterval(timers[fid].iv); /* keep startMs */ }
+}
+
+// ─── Formatters ───────────────────────────────────────────────────────────────
+function fmtMs(ms){
+  const s = Math.floor(ms/1000);
+  const m = Math.floor(s/60);
+  return m>0 ? `${m}:${String(s%60).padStart(2,'0')}` : `0:${String(s).padStart(2,'0')}`;
+}
+
+function fmtDur(sec){
+  if(sec===null||sec===undefined) return '—';
+  if(sec<60) return sec.toFixed(1)+'s';
+  const m=Math.floor(sec/60), s=Math.round(sec%60);
+  return `${m}m ${s}s`;
+}
+
+function esc(s){
+  return String(s)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+}
+
+// ─── Toast ────────────────────────────────────────────────────────────────────
+function showToast(msg, type=''){
+  const el = document.createElement('div');
+  el.className='toast '+(type||'');
+  el.textContent=msg;
+  document.getElementById('toasts').appendChild(el);
+  setTimeout(()=>el.remove(), 4500);
+}
+</script>
+</body>
+</html>

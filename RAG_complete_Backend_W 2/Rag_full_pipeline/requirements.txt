@@ -27,6 +27,7 @@ aioboto3>=12.3.0
 pypdf>=4.0.0
 pillow<12.0.0
 PyMuPDF>=1.24.0,<2.0.0        # Used by DotsOCR for page rendering
+opencv-python-headless>=4.8.0  # Preprocessing: deskew, denoise, CLAHE (no GUI deps)
 
 # ── Chunking / Tokenisation ───────────────────────────────────────────────────
 tiktoken>=0.7.0
