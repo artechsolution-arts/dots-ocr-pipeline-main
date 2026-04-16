@@ -78,46 +78,52 @@ class DotsOCRParser:
         device = get_device()
         dtype = torch.bfloat16 if device in ("mps", "cuda") else torch.float32
 
-        # Suppress transformers-level logging and Python warnings during load.
+        # ── Silence all logging + print() spam during model load ──────────────
         _prev_verbosity = _transformers.logging.get_verbosity()
         _transformers.logging.set_verbosity_error()
         warnings.filterwarnings("ignore", message=".*[Ff]lash.?[Aa]ttention.*")
         warnings.filterwarnings("ignore", message=".*flash_attn.*")
         warnings.filterwarnings("ignore", message=".*FutureWarning.*")
+        warnings.filterwarnings("ignore", category=FutureWarning)
 
         try:
-            # Key fixes for MPS (Apple Silicon):
+            # ── Why device_map={"": device} solves the meta tensor crash ──────
             #
-            # 1. No device_map="auto" — accelerate creates meta tensors and then
-            #    calls model.to(device), which raises "Cannot copy out of meta
-            #    tensor" on MPS.  We load to CPU first and move manually below.
+            # The root cause: transformers (any version) + accelerate use
+            # init_empty_weights() internally when loading large models, which
+            # allocates parameters as "meta" tensors (storage-less placeholders).
+            # Calling model.to(device) on a meta tensor raises:
+            #   "Cannot copy out of meta tensor; no data!"
             #
-            # 2. low_cpu_mem_usage=False — transformers ≥4.38 silently enables
-            #    low_cpu_mem_usage=True as default even without device_map, which
-            #    also creates meta tensors.  Explicitly disable it.
+            # device_map="auto" triggers this and then calls model.to(device)
+            # incorrectly → crash.
             #
-            # 3. attn_implementation="eager" — most compatible across all
-            #    transformers versions on MPS/CPU.  SDPA and flash_attention_2
-            #    both print "flash attention not available!" spam via print()
-            #    on every attention layer init.  "eager" avoids this entirely.
+            # device_map={"": device} tells accelerate to place EVERY layer on
+            # the same single device.  Accelerate then uses its own correct path:
+            #   set_module_tensor_to_device(..., device, value=loaded_weight)
+            # which calls to_empty(device) + copies actual weight data in one
+            # step per parameter — no raw model.to(device) call on meta tensors.
+            # The resulting model arrives on MPS fully materialised, no .to()
+            # needed afterward.
             #
-            # 4. contextlib.redirect_stdout — catches any remaining print()
-            #    calls from within trust_remote_code model init (e.g. the
-            #    "flash attention not available! fallback to eager" messages
-            #    emitted by the DotsOCR attention layers regardless of attn_impl).
+            # attn_implementation="eager": avoids SDPA/flash_attn probing that
+            # emits "flash attention not available!" via print() on every layer.
+            #
+            # contextlib.redirect_stdout: catches any remaining print() calls
+            # from within the trust_remote_code model's __init__ that
+            # warnings.filterwarnings() cannot intercept.
             with contextlib.redirect_stdout(io.StringIO()):
                 self.model = AutoModelForCausalLM.from_pretrained(
                     model_path,
                     attn_implementation="eager",
                     torch_dtype=dtype,
                     trust_remote_code=True,
-                    low_cpu_mem_usage=False,
+                    device_map={"": device},   # Load ALL layers directly to MPS/CPU
                 )
         finally:
             _transformers.logging.set_verbosity(_prev_verbosity)
 
-        # Move from CPU to target device (safe — no meta tensors at this point)
-        self.model = self.model.to(device)
+        # Model is already on device — no .to() call needed or safe here.
         self.processor = AutoProcessor.from_pretrained(
             model_path, trust_remote_code=True, use_fast=True
         )
