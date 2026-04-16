@@ -72,6 +72,83 @@ from src.ingestion.preprocessing.preprocessor import DocumentPreprocessor
 
 logger = logging.getLogger(__name__)
 
+
+def _patch_ocr_loader(DotsOCRParser) -> None:
+    """
+    Replace DotsOCRParser._load_hf_model with a version that loads cleanly on
+    Apple MPS (M1/M2/M3/M4) without the "Cannot copy out of meta tensor" crash.
+
+    Why this is needed
+    ------------------
+    Any version of dots_ocr (and transformers ≥4.35) can produce meta tensors
+    during model construction — storage-less placeholder parameters used to
+    reduce peak memory.  The original code then calls:
+
+        self.model = self.model.to(device)          # crashes on meta tensors
+        # or
+        self.model = AutoModelForCausalLM.from_pretrained(..., device_map="auto")
+        self.model = self.model.to(device)          # same crash
+
+    The fix: device_map={"": device}
+    ---------------------------------
+    This tells accelerate to place ALL layers on a single device in one pass.
+    Accelerate uses set_module_tensor_to_device() which calls to_empty(device)
+    + copies actual weight data per parameter — it NEVER calls the bare
+    model.to(device) that crashes on meta tensors.  The model arrives on MPS
+    fully materialised; no separate .to() call is needed or safe.
+
+    Additional fixes applied here
+    -----------------------------
+    - attn_implementation="eager": avoids SDPA/flash_attn probing which emits
+      "flash attention not available!" via print() on every attention layer.
+    - contextlib.redirect_stdout: silences any remaining print() from the
+      trust_remote_code model __init__ that warnings.filterwarnings() misses.
+    - Transformers logging set to ERROR during load to suppress INFO spam.
+
+    This function patches the CLASS (not an instance) so all three OCR worker
+    threads pick up the fix without any extra steps.
+    """
+    import io
+    import warnings
+    import contextlib
+
+    def _safe_load_hf_model(self):
+        import torch
+        import transformers as _t
+        from transformers import AutoModelForCausalLM, AutoProcessor
+        from qwen_vl_utils import process_vision_info
+        from dots_ocr.utils.device_utils import get_device
+
+        device = get_device()
+        dtype  = torch.bfloat16 if device in ("mps", "cuda") else torch.float32
+
+        prev = _t.logging.get_verbosity()
+        _t.logging.set_verbosity_error()
+        warnings.filterwarnings("ignore", message=".*[Ff]lash.?[Aa]ttention.*")
+        warnings.filterwarnings("ignore", message=".*flash_attn.*")
+        warnings.filterwarnings("ignore", category=FutureWarning)
+
+        try:
+            with contextlib.redirect_stdout(io.StringIO()):
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_path,
+                    attn_implementation="eager",
+                    torch_dtype=dtype,
+                    trust_remote_code=True,
+                    device_map={"": device},  # Load ALL layers directly to MPS
+                )
+        finally:
+            _t.logging.set_verbosity(prev)
+
+        # Model is already on device — no .to() call needed or safe here
+        self.processor = AutoProcessor.from_pretrained(
+            self.model_path, trust_remote_code=True, use_fast=True
+        )
+        self.process_vision_info = process_vision_info
+
+    DotsOCRParser._load_hf_model = _safe_load_hf_model
+
+
 # ── Sentinel ──────────────────────────────────────────────────────────────────
 _STOP = object()
 
@@ -286,6 +363,13 @@ class StagePipeline:
     def _load_ocr_parser(self):
         try:
             from dots_ocr import DotsOCRParser
+
+            # Patch _load_hf_model on the class before instantiation so that
+            # __init__ calls our safe version.  This works regardless of which
+            # version of dots_ocr is installed and does not require editing
+            # any dots_ocr source file.
+            _patch_ocr_loader(DotsOCRParser)
+
             parser = DotsOCRParser(
                 ip=cfg.dots_ocr_ip, port=cfg.dots_ocr_port,
                 model_name=cfg.dots_ocr_weights_path,
