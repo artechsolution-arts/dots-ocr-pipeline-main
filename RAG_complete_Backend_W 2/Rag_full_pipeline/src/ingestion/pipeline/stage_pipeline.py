@@ -182,7 +182,12 @@ class StagePipeline:
                 break
             doc: DocJob = item
             try:
-                self._update_stage(doc.file_id, doc.session_id, "preprocessing", 5)
+                # Record the moment this specific file enters active processing.
+                # started_at is passed as an extra field so the UI timer for
+                # this file begins only when the pipeline actually picks it up,
+                # not at upload/queue time.
+                self._update_stage(doc.file_id, doc.session_id, "preprocessing", 5,
+                                   started_at=time.time())
                 pages_yielded = 0
                 for page_idx, total_pages, enhanced, origin in \
                         self._preprocessor.stream_pages(doc.raw_bytes):

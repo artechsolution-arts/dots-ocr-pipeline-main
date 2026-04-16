@@ -109,23 +109,35 @@ class DotsOCRParser:
         import json
         import re
 
-        # --- Square Padding and Resolution Locking ---
+        # ── Aspect-ratio-preserving resize ─────────────────────────────────────
+        # DotsOCR (Qwen-VL) uses 14×14 ViT patches merged 2×2 → 28-px grid.
+        # We preserve the page's natural portrait/landscape ratio so scanned
+        # invoices, wide tables, and A4 portrait pages all get correct layout.
+        # No square padding — padding wastes pixels and confuses the model.
+        PATCH  = 28             # Qwen vision-encoder effective patch stride
+        MAX_PX = 1008 * 1008    # pixel budget (~1 M) — quality vs speed balance
+        MIN_PX = 336 * 336      # minimum so small pages stay legible
+
         original_w, original_h = image.size
-        # Calculate padding to make it a square
-        max_side = max(original_w, original_h)
-        padded_image = Image.new("RGB", (max_side, max_side), (255, 255, 255))
-        
-        # Center the image
-        offset_x = (max_side - original_w) // 2
-        offset_y = (max_side - original_h) // 2
-        padded_image.paste(image, (offset_x, offset_y))
-        
-        # Lock resolution to 1008 for optimal attention sequence
-        # We use 1008 because it's a multiple of 14 and 28
-        target_res = 1008
-        inference_image = padded_image.resize((target_res, target_res), Image.LANCZOS)
-        
-        print(f"DEBUG: Padded image to {max_side}x{max_side}, then resized to {target_res}x{target_res} for inference.")
+        cur_px = original_w * original_h
+
+        # Scale factor: shrink if too large, enlarge if too small
+        if cur_px > MAX_PX:
+            scale = (MAX_PX / cur_px) ** 0.5
+        elif cur_px < MIN_PX:
+            scale = (MIN_PX / cur_px) ** 0.5
+        else:
+            scale = 1.0
+
+        # Round to nearest multiple of PATCH (required by Qwen visual encoder)
+        target_w = max(PATCH, round(original_w * scale / PATCH) * PATCH)
+        target_h = max(PATCH, round(original_h * scale / PATCH) * PATCH)
+
+        inference_image = image.resize((target_w, target_h), Image.LANCZOS)
+
+        # Per-axis scale for bbox remapping (inference coords → original coords)
+        sx = original_w / target_w
+        sy = original_h / target_h
 
         messages = [
             {
@@ -142,8 +154,8 @@ class DotsOCRParser:
 
         # Preparation for inference
         text = self.processor.apply_chat_template(
-            messages, 
-            tokenize=False, 
+            messages,
+            tokenize=False,
             add_generation_prompt=True
         )
         image_inputs, video_inputs = self.process_vision_info(messages)
@@ -165,45 +177,33 @@ class DotsOCRParser:
         # Inference: Generation of the output
         generated_ids = self.model.generate(**inputs, max_new_tokens=4096)
         generated_ids_trimmed = [
-            out_ids[len(in_ids) :] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
+            out_ids[len(in_ids):] for in_ids, out_ids in zip(inputs.input_ids, generated_ids)
         ]
         response = self.processor.batch_decode(
             generated_ids_trimmed, skip_special_tokens=True, clean_up_tokenization_spaces=False
         )[0]
-        
-        # --- Reverse Mapping of Bboxes ---
-        # The model output bboxes are in the target_res (1008) coordinate system.
-        # We need to map them back to original_w, original_h.
+
+        # ── Bbox remapping ─────────────────────────────────────────────────────
+        # Model output coords are in (target_w × target_h) inference space.
+        # Scale back to original page dimensions using per-axis factors.
+        # No square-padding offset needed — we preserved the aspect ratio.
         try:
-            # We look for JSON list patterns in the response
             json_match = re.search(r'\[\s*\{.*\}\s*\]', response, re.DOTALL)
             if json_match:
-                json_str = json_match.group(0)
-                cells = json.loads(json_str)
-                
-                scale = max_side / target_res
+                cells = json.loads(json_match.group(0))
                 for cell in cells:
                     if 'bbox' in cell:
-                        # Scale back to square space
                         x1, y1, x2, y2 = cell['bbox']
-                        x1 = x1 * scale - offset_x
-                        y1 = y1 * scale - offset_y
-                        x2 = x2 * scale - offset_x
-                        y2 = y2 * scale - offset_y
-                        
-                        # Clip to original image bounds
                         cell['bbox'] = [
-                            max(0, int(x1)), 
-                            max(0, int(y1)), 
-                            min(original_w, int(x2)), 
-                            min(original_h, int(y2))
+                            max(0,          int(x1 * sx)),
+                            max(0,          int(y1 * sy)),
+                            min(original_w, int(x2 * sx)),
+                            min(original_h, int(y2 * sy)),
                         ]
-                
                 response = json.dumps(cells, ensure_ascii=False)
-        except Exception as e:
-            print(f"DEBUG: Failed to re-map bboxes: {e}")
+        except Exception:
+            pass  # Keep raw response if remapping fails
 
-        print(f"DEBUG: Raw model response (re-mapped): {response}")
         return response
 
     def _inference_with_vllm(self, image, prompt):

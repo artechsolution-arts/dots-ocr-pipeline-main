@@ -396,12 +396,14 @@ function createSessionUI(sid, files, deptId){
 }
 
 function addFileCard(sid, fid, filename, sizeKb){
-  sessions[sid].files[fid] = {stage:'queued',pct:0,pages:0,chunks:0,filename,sizeKb,startMs:Date.now()};
+  // startMs is null until the file actually enters preprocessing on the server.
+  // This ensures the per-file timer reflects real processing time, not queue wait.
+  sessions[sid].files[fid] = {stage:'queued',pct:0,pages:0,chunks:0,filename,sizeKb,startMs:null};
   const el = document.createElement('div');
   el.className='fcard'; el.id='fcard-'+fid;
   el.innerHTML = renderCard(fid, sessions[sid].files[fid]);
   document.getElementById('sfiles-'+sid).appendChild(el);
-  startTimer(fid, sessions[sid].files[fid].startMs);
+  // Timer starts in onFileProgress when preprocessing stage is received
 }
 
 // ─── Card renderer ────────────────────────────────────────────────────────────
@@ -412,15 +414,19 @@ function renderCard(fid, f){
   const isRun   = !TERMINAL.has(f.stage);
   const stageLabel = isSkip?'Skipped (dup)': f.stage.charAt(0).toUpperCase()+f.stage.slice(1);
 
-  // Timer display
+  // Timer display — shows per-file elapsed processing time
   let timerTxt, timerCls;
   if(isDone||isErr){
     stopTimer(fid);
-    timerTxt = f.duration!=null ? fmtDur(f.duration) : (timers[fid]? fmtMs(Date.now()-timers[fid].startMs): '—');
+    timerTxt = f.duration!=null ? fmtDur(f.duration)
+             : timers[fid]      ? fmtMs(Date.now()-timers[fid].startMs)
+             : '—';
     timerCls = isDone?'done':'err';
+  } else if(f.startMs){
+    timerTxt = fmtMs(Date.now()-f.startMs);
+    timerCls = 'run';
   } else {
-    const ms = timers[fid] ? Date.now()-timers[fid].startMs : Date.now()-f.startMs;
-    timerTxt = fmtMs(ms);
+    timerTxt = 'Queued';
     timerCls = 'run';
   }
 
@@ -507,7 +513,15 @@ function onFileProgress(sid, d){
   f.pages    = d.pages  || f.pages;
   f.chunks   = d.chunks || f.chunks;
   f.duration = d.duration;
-  if(d.started_at && !f.serverStart) f.serverStart = d.started_at;
+
+  // Start the per-file timer the moment preprocessing begins on the server.
+  // d.started_at is epoch seconds (set by stage_pipeline when it picks up the file).
+  // Converting to ms gives an absolute start point — the timer tick shows real
+  // processing time, not how long the file waited in the queue.
+  if(d.started_at && !f.startMs){
+    f.startMs = Math.round(d.started_at * 1000);
+    startTimer(d.file_id, f.startMs);
+  }
 
   // Rebuild card
   const el = document.getElementById('fcard-'+d.file_id); if(!el) return;
@@ -517,11 +531,9 @@ function onFileProgress(sid, d){
     d.stage==='error' ? 'err' : 'run'
   );
 
-  // Timer
+  // Stop the live tick once terminal — final time is shown from f.duration
   if(TERMINAL.has(d.stage)){
     stopTimer(d.file_id);
-  } else {
-    ensureTimer(d.file_id, f.startMs);
   }
 }
 
@@ -564,10 +576,6 @@ function startTimer(fid, startMs){
     }
   }, 500);
   timers[fid] = {startMs, iv};
-}
-
-function ensureTimer(fid, startMs){
-  if(!timers[fid]) startTimer(fid, startMs||Date.now());
 }
 
 function stopTimer(fid){

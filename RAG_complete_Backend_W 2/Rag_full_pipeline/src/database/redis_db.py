@@ -114,9 +114,15 @@ class RedisStateManager:
 
     def update_stage(self, file_id, session_id, stage, pct, extra=None, publish=True):
         updates = {"stage": stage, "pct": str(pct)}
-        if extra: updates.update({k: str(v) if v is not None else "" for k, v in extra.items()})
-        if stage == "validating": updates.setdefault("started_at", str(time.time()))
-        if stage in TERMINAL_STAGES: updates.setdefault("finished_at", str(time.time()))
+        # Merge extra fields (e.g. started_at passed by stage workers)
+        if extra:
+            updates.update({k: str(v) if v is not None else "" for k, v in extra.items()})
+        # Set started_at when actual processing begins (preprocessing stage),
+        # overriding the upload-time placeholder stored at registration.
+        if stage == "preprocessing" and "started_at" not in updates:
+            updates["started_at"] = str(time.time())
+        if stage in TERMINAL_STAGES:
+            updates.setdefault("finished_at", str(time.time()))
         self.r.hset(RK.file(file_id), mapping=updates)
         if publish: self._publish(session_id, file_id)
 
