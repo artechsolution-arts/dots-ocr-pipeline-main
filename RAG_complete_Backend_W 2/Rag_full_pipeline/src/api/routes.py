@@ -98,9 +98,25 @@ def create_router(rsm, ids, pipeline, mq_conn):
         if not rsm or not rsm.ping():
             raise HTTPException(503, "Redis is offline — cannot accept ingestion jobs")
 
+        # Batch size cap
+        if len(files) > cfg.max_batch_files:
+            raise HTTPException(
+                400,
+                f"Batch too large: {len(files)} files submitted, maximum is {cfg.max_batch_files}",
+            )
+
         # Resolve dept/user — fall back to seeded system defaults
         resolved_dept = dept_id or ids.get("dept_default")
         resolved_user = user_id or ids.get("user_default")
+
+        # Rate limiting per department
+        allowed, count = rsm.check_rate_limit(str(resolved_dept))
+        if not allowed:
+            raise HTTPException(
+                429,
+                f"Rate limit exceeded: {count} files submitted this hour "
+                f"(limit: 200). Try again later.",
+            )
 
         max_bytes = int(cfg.max_pdf_size_mb * 1024 * 1024)
         session_id = str(uuid.uuid4())
@@ -125,6 +141,13 @@ def create_router(rsm, ids, pipeline, mq_conn):
                 raise HTTPException(
                     413,
                     f"'{f.filename}' exceeds {cfg.max_pdf_size_mb} MB limit",
+                )
+
+            # Magic byte check — reject non-PDF bytes regardless of file extension
+            if not contents.startswith(b"%PDF-"):
+                raise HTTPException(
+                    400,
+                    f"'{f.filename}' does not appear to be a valid PDF file",
                 )
 
             file_id = str(uuid.uuid4())

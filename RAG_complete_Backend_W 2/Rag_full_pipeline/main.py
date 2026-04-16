@@ -88,13 +88,16 @@ async def lifespan(app: FastAPI):
 
     # 1. PostgreSQL ─────────────────────────────────────────────────────────────
     try:
-        _pool_pg = get_pg_pool(minconn=1, maxconn=cfg.upload_workers + 5)
+        maxconn = max(20, cfg.upload_workers + 15)
+        _pool_pg = get_pg_pool(minconn=2, maxconn=maxconn)
         conn = _pool_pg.getconn()
         conn.autocommit = True
-        create_schema(conn)
-        _ids = _init_system_defaults(RBACManager(conn))
-        _pool_pg.putconn(conn)
-        logger.info("PostgreSQL ready (pgvector schema applied)")
+        try:
+            create_schema(conn)
+            _ids = _init_system_defaults(RBACManager(conn))
+        finally:
+            _pool_pg.putconn(conn)
+        logger.info("PostgreSQL ready (pgvector schema applied, pool maxconn=%d)", maxconn)
     except Exception as e:
         logger.error("PostgreSQL init failed: %s", e)
 
@@ -214,13 +217,16 @@ async def _run_worker_only():
 
     # 1. PostgreSQL
     try:
-        _pool_pg = get_pg_pool(minconn=1, maxconn=cfg.upload_workers + 5)
+        maxconn = max(20, cfg.upload_workers + 15)
+        _pool_pg = get_pg_pool(minconn=2, maxconn=maxconn)
         conn = _pool_pg.getconn()
         conn.autocommit = True
-        create_schema(conn)
-        _ids = _init_system_defaults(RBACManager(conn))
-        _pool_pg.putconn(conn)
-        logger.info("PostgreSQL ready")
+        try:
+            create_schema(conn)
+            _ids = _init_system_defaults(RBACManager(conn))
+        finally:
+            _pool_pg.putconn(conn)
+        logger.info("PostgreSQL ready (pool maxconn=%d)", maxconn)
     except Exception as e:
         logger.error("PostgreSQL init failed: %s", e)
 

@@ -21,14 +21,17 @@ from PIL import Image
 @dataclass
 class DocJob:
     """A document submitted to the pipeline."""
-    file_id:     str
-    session_id:  str
-    filename:    str
-    raw_bytes:   bytes
-    user_id:     str
-    dept_id:     str
-    upload_id:   Optional[str] = None
-    upload_type: str = "user"
+    file_id:      str
+    session_id:   str
+    filename:     str
+    raw_bytes:    bytes
+    user_id:      str
+    dept_id:      str
+    upload_id:    Optional[str] = None
+    upload_type:  str = "user"
+    # SHA-256 of raw_bytes computed in preprocess worker so the single
+    # assembler thread never has to hash a 200 MB PDF.
+    content_hash: str = ""
 
 
 # ── Stage 1 → Stage 2 ────────────────────────────────────────────────────────
@@ -101,6 +104,8 @@ class ChunkItem:
     metadata:     dict
     content_hash: str
     doc_job:      DocJob
+    # Accurate tiktoken token count from the chunker (not a word-split approximation)
+    token_count:  int = 0
 
 
 # ── Stage 6 → Stage 7 ────────────────────────────────────────────────────────

@@ -183,11 +183,29 @@ def create_schema(conn):
         "CREATE INDEX IF NOT EXISTS idx_chunk_doc      ON chunks(document_id);",
         "CREATE INDEX IF NOT EXISTS idx_emb_dept       ON embeddings(department_id);",
         """CREATE INDEX IF NOT EXISTS idx_emb_vector
-           ON embeddings USING hnsw (embedding vector_cosine_ops) WITH (m = 16, ef_construction = 64);""",
+           ON embeddings USING hnsw (embedding vector_cosine_ops) WITH (m = 24, ef_construction = 128);""",
         "CREATE INDEX IF NOT EXISTS idx_rrl_chat       ON rag_retrieval_log(chat_id);",
         "CREATE INDEX IF NOT EXISTS idx_aa_dept        ON admin_actions(department_id);",
     ]:
         cur.execute(sql)
+    # Rebuild HNSW index if it was created with old (m=16) params.
+    # pg_indexes stores the full index definition including WITH clause options.
+    cur.execute("""
+        DO $$ BEGIN
+          IF EXISTS (
+            SELECT 1 FROM pg_indexes
+            WHERE indexname = 'idx_emb_vector'
+              AND indexdef NOT LIKE '%m=24%'
+              AND indexdef NOT LIKE '%m = 24%'
+          ) THEN
+            DROP INDEX idx_emb_vector;
+          END IF;
+        END $$;
+    """)
+    cur.execute("""CREATE INDEX IF NOT EXISTS idx_emb_vector
+                   ON embeddings USING hnsw (embedding vector_cosine_ops)
+                   WITH (m = 24, ef_construction = 128);""")
+
     conn.commit()
     cur.close()
     logger.info("[Schema] Tables + indexes ready ✓")
@@ -379,16 +397,22 @@ class RBACManager:
         finally:
             self._put_conn(conn)
 
+    @staticmethod
+    def _vec_str(embedding) -> str:
+        """Serialize a float list to pgvector literal without scientific notation."""
+        return '[' + ','.join(f'{v:.8f}' for v in embedding) + ']'
+
     def store_embedding(self, chunk_id, dept_id, embedding,
                         source_user_upload_id=None, source_admin_upload_id=None):
         conn = self._get_conn()
         try:
             cur = self._cur(conn)
+            vec = self._vec_str(embedding)
             cur.execute("""INSERT INTO embeddings
                            (chunk_id,department_id,embedding,embedding_model,
                             source_user_upload_id,source_admin_upload_id)
                            VALUES (%s,%s,%s::vector,%s,%s,%s) RETURNING id""",
-                        (chunk_id, dept_id, str(embedding), cfg.embedding_model,
+                        (chunk_id, dept_id, vec, cfg.embedding_model,
                          source_user_upload_id, source_admin_upload_id))
             r = str(cur.fetchone()["id"]); cur.close(); return r
         finally:
@@ -411,6 +435,7 @@ class RBACManager:
         conn = self._get_conn()
         try:
             cur = self._cur(conn)
+            vec = self._vec_str(query_embedding)
             cur.execute("""
                 SELECT e.chunk_id, c.chunk_text, c.document_id, c.page_num,
                        e.department_id, d.file_name,
@@ -424,7 +449,7 @@ class RBACManager:
                          WHERE  receiving_dept_id=%s
                            AND  (expires_at IS NULL OR expires_at>NOW()))
                 ORDER  BY e.embedding <=> %s::vector LIMIT %s""",
-                (str(query_embedding), dept_id, dept_id, str(query_embedding), top_k))
+                (vec, dept_id, dept_id, vec, top_k))
             r = [dict(row) for row in cur.fetchall()]; cur.close(); return r
         finally:
             self._put_conn(conn)
