@@ -1,0 +1,179 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  DotsOCR Unified Pipeline — Docker Compose
+#  This file orchestrates the entire project (RAG Backend + Ingestion + Infra)
+# ═══════════════════════════════════════════════════════════════════════════════
+
+x-common-env: &common-env
+  # Database
+  PG_HOST: postgres
+  PG_PORT: 5432
+  PG_DATABASE: virchow_dev
+  PG_USER: postgres
+  PG_PASSWORD: Eppl$$456!
+  
+  # Cache & Messaging
+  REDIS_HOST: redis
+  REDIS_PORT: 6379
+  REDIS_DB: 0
+  RABBIT_HOST: rabbitmq
+  RABBIT_PORT: 5672
+  RABBIT_USER: guest
+  RABBIT_PASS: guest
+  RABBIT_VHOST: /
+  
+  # Storage
+  SEAWEEDFS_MASTER_URL: http://seaweedfs_master:9333
+  SEAWEEDFS_FILER_URL: http://seaweedfs_filer:8888
+  SEAWEEDFS_BUCKET: rag-pipeline
+  UPLOAD_DIR: /app/uploads
+  
+  # OCR & AI Config
+  DOTS_OCR_MODEL: rednote-hilab/dots.ocr
+  DOTS_OCR_USE_HF: "true"
+  DOTS_OCR_PROMPT_MODE: prompt_layout_all_en
+  DOTS_OCR_FITZ_PREPROCESS: "true"
+  DOTS_OCR_WEIGHTS: /app/weights/DotsOCR
+  EMBEDDING_DEVICE: cpu
+  LOG_LEVEL: INFO
+  # Frontend & Backend URLs
+  FRONTEND_URL: http://localhost:7860
+  BACKEND_URL: http://localhost:8000
+  BACKEND_HOST: api
+  BACKEND_PORT: 8000
+
+services:
+
+  # ── Infrastructure: PostgreSQL (pgvector) ──────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: dots-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER:-postgres}
+      POSTGRES_PASSWORD: ${PG_PASSWORD:-Eppl$$456!}
+      POSTGRES_DB: ${PG_DATABASE:-virchow_dev}
+    networks:
+      - dots-net
+
+  # ── Infrastructure: Redis ──────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: dots-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - dots-net
+
+  # ── Infrastructure: RabbitMQ ───────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: dots-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - dots-net
+
+  # ── Infrastructure: SeaweedFS Master ───────────────────────────────────────
+  seaweedfs_master:
+    image: chrislusf/seaweedfs:latest
+    container_name: dots-seaweed-master
+    command: "master -mdir=/data"
+    ports: ["9333:9333"]
+    networks: [dots-net]
+
+  # ── Infrastructure: SeaweedFS Filer ────────────────────────────────────────
+  seaweedfs_filer:
+    image: chrislusf/seaweedfs:latest
+    container_name: dots-seaweed-filer
+    command: 'filer -master="seaweedfs_master:9333"'
+    ports: ["8888:8888"]
+    depends_on: [seaweedfs_master]
+    networks: [dots-net]
+
+  # ── App: FastAPI Backend (RAG Upload UI & Endpoints) ───────────────────────
+  api:
+    build:
+      context: ./RAG_complete_Backend_W 2/Rag_full_pipeline
+      dockerfile: Dockerfile
+    container_name: dots-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *common-env
+      RUN_TYPE: api
+    volumes:
+      - ./dots_ocr:/app/dots_ocr:ro        # Mount local dots_ocr package
+      - ./weights:/app/weights:ro          # Mount local model weights
+      - ./RAG_complete_Backend_W 2/Rag_full_pipeline/uploads:/app/uploads
+    networks:
+      - dots-net
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+
+  # ── App: RabbitMQ Ingestion Worker ─────────────────────────────────────────
+  worker:
+    build:
+      context: ./RAG_complete_Backend_W 2/Rag_full_pipeline
+      dockerfile: Dockerfile
+    container_name: dots-worker
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      RUN_TYPE: worker
+    volumes:
+      - ./dots_ocr:/app/dots_ocr:ro        # Mount local dots_ocr package
+      - ./weights:/app/weights:ro          # Mount local model weights
+      - ./RAG_complete_Backend_W 2/Rag_full_pipeline/uploads:/app/uploads
+    networks:
+      - dots-net
+    depends_on:
+      - postgres
+      - redis
+      - rabbitmq
+
+  # ── App: DotsOCR Gradio Demo Sandbox ───────────────────────────────────────
+  gradio_demo:
+    build:
+      context: ./RAG_complete_Backend_W 2/Rag_full_pipeline
+      dockerfile: Dockerfile
+    container_name: dots-gradio
+    restart: unless-stopped
+    ports:
+      - "7860:7860"
+    command: ["python", "/app/demo/demo_gradio.py", "7860"]
+    environment:
+      - PYTHONPATH=/app
+      - DOTS_OCR_WEIGHTS=/app/weights/DotsOCR
+    volumes:
+      - ./:/app:ro
+    networks:
+      - dots-net
+
+  # ── App: Streamlit UI ────────────────────────────────────────────────────────
+  streamlit_demo:
+    build:
+      context: ./RAG_complete_Backend_W 2/Rag_full_pipeline
+      dockerfile: Dockerfile
+    container_name: dots-streamlit
+    restart: unless-stopped
+    ports:
+      - "8501:8501"
+    command: ["streamlit", "run", "/app/demo/demo_streamlit.py", "--server.port", "8501"]
+    environment:
+      - PYTHONPATH=/app
+      - DOTS_OCR_WEIGHTS=/app/weights/DotsOCR
+    volumes:
+      - ./:/app:ro
+    networks:
+      - dots-net
+
+networks:
+  dots-net:
+    name: dots_pipeline_net
+    driver: bridge

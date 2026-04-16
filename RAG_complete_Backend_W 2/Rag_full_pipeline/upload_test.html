@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Pipeline Uploader</title>
+    <!-- Use Inter font & Tailwind for quick, clean design -->
+    <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&display=swap" rel="stylesheet">
+    <script src="https://cdn.tailwindcss.com"></script>
+    <style>
+        body { font-family: 'Inter', sans-serif; background: #0f172a; color: #f8fafc; }
+        .glass-panel { background: rgba(30, 41, 59, 0.7); backdrop-filter: blur(12px); border: 1px solid rgba(255, 255, 255, 0.1); }
+        .spinner { animation: spin 1s linear infinite; }
+        @keyframes spin { 100% { transform: rotate(360deg); } }
+    </style>
+</head>
+<body class="min-h-screen flex items-center justify-center p-4">
+
+    <div class="glass-panel p-8 rounded-2xl shadow-2xl w-full max-w-lg">
+        <div class="text-center mb-8">
+            <h1 class="text-3xl font-bold bg-clip-text text-transparent bg-gradient-to-r from-blue-400 to-emerald-400">RAG Pipeline Ingestion</h1>
+            <p class="text-slate-400 mt-2 text-sm">Upload your PDF documents directly to the backend workers</p>
+        </div>
+
+        <form id="uploadForm" class="space-y-5">
+            <!-- File Input -->
+            <div class="relative flex items-center justify-center w-full">
+                <label for="file_upload" class="flex flex-col items-center justify-center w-full h-32 border-2 border-slate-600 border-dashed rounded-xl cursor-pointer hover:bg-slate-800/50 hover:border-emerald-500 transition-colors">
+                    <div class="flex flex-col items-center justify-center pt-5 pb-6">
+                        <svg class="w-8 h-8 mb-3 text-slate-400" fill="none" stroke="currentColor" viewBox="0 0 24 24" xmlns="http://www.w3.org/2000/svg"><path stroke-linecap="round" stroke-linejoin="round" stroke-width="2" d="M7 16a4 4 0 01-.88-7.903A5 5 0 1115.9 6L16 6a5 5 0 011 9.9M15 13l-3-3m0 0l-3 3m3-3v12"></path></svg>
+                        <p class="mb-2 text-sm text-slate-400" id="file_label"><span class="font-semibold text-emerald-400">Click to browse</span> or drag and drop</p>
+                        <p class="text-xs text-slate-500">PDF documents only</p>
+                    </div>
+                    <input id="file_upload" type="file" accept="application/pdf" class="hidden" multiple required />
+                </label>
+            </div>
+
+            <!-- Metadata Inputs -->
+            <div class="grid grid-cols-2 gap-4">
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1">User ID (UUID)</label>
+                    <input type="text" id="user_id" value="b1ac8008-a368-4e10-ae27-a7f2bf5588d1" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors">
+                </div>
+                <div>
+                    <label class="block text-xs font-medium text-slate-400 mb-1">Department ID (UUID)</label>
+                    <input type="text" id="dept_id" value="a3a33137-9225-467b-9635-768d48a7dc14" class="w-full bg-slate-800 border border-slate-700 rounded-lg px-3 py-2 text-sm focus:outline-none focus:border-blue-500 transition-colors">
+                </div>
+            </div>
+
+            <!-- Submit Button -->
+            <button type="submit" id="submitBtn" class="w-full mt-4 bg-gradient-to-r from-blue-600 to-emerald-600 hover:from-blue-500 hover:to-emerald-500 text-white font-semibold py-3 px-4 rounded-xl shadow-lg transform transition-all duration-200 active:scale-95 flex justify-center items-center gap-2">
+                <span>Upload Document</span>
+                <svg id="spinner" class="hidden w-5 h-5 text-white spinner" xmlns="http://www.w3.org/2000/svg" fill="none" viewBox="0 0 24 24"><circle class="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" stroke-width="4"></circle><path class="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path></svg>
+            </button>
+        </form>
+
+        <!-- Response Area -->
+        <div id="responseArea" class="hidden mt-6 bg-slate-800 border border-slate-700 rounded-xl p-4">
+            <h3 class="text-xs font-bold uppercase tracking-wider text-slate-500 mb-2">Response:</h3>
+            <pre id="responseText" class="text-xs text-emerald-400 whitespace-pre-wrap break-words font-mono"></pre>
+        </div>
+    </div>
+
+    <script>
+        // Update label when file selected
+        const fileInput = document.getElementById('file_upload');
+        const fileLabel = document.getElementById('file_label');
+        
+        fileInput.addEventListener('change', function(e) {
+            if(e.target.files.length > 0) {
+                const count = e.target.files.length;
+                fileLabel.innerHTML = `<span class="text-emerald-400 font-medium">${count} file${count > 1 ? 's' : ''} selected</span>`;
+            }
+        });
+
+        // Handle upload
+        document.getElementById('uploadForm').addEventListener('submit', async (e) => {
+            e.preventDefault();
+            
+            if(fileInput.files.length === 0) return alert('Please select at least one PDF file!');
+
+            const userId = document.getElementById('user_id').value;
+            const deptId = document.getElementById('dept_id').value;
+            
+            const btn = document.getElementById('submitBtn');
+            const spinner = document.getElementById('spinner');
+            const respArea = document.getElementById('responseArea');
+            const respText = document.getElementById('responseText');
+
+            // UI Loading state
+            btn.disabled = true;
+            spinner.classList.remove('hidden');
+            btn.classList.add('opacity-80');
+            respArea.classList.add('hidden');
+
+            const formData = new FormData();
+            for (let i = 0; i < fileInput.files.length; i++) {
+                formData.append('files', fileInput.files[i]);
+            }
+            formData.append('user_id', userId);
+            formData.append('dept_id', deptId);
+            formData.append('upload_type', 'user');
+            formData.append('chat_id', '');
+
+            try {
+                // Adjust port if API runs on a different port locally
+                const response = await fetch('http://localhost:8000/upload/pdfs', {
+                    method: 'POST',
+                    body: formData
+                });
+                
+                const data = await response.json();
+                
+                respArea.classList.remove('hidden');
+                if (response.ok) {
+                    respText.className = 'text-xs text-emerald-400 whitespace-pre-wrap break-words font-mono';
+                    respText.textContent = JSON.stringify(data, null, 2);
+                } else {
+                    respText.className = 'text-xs text-red-400 whitespace-pre-wrap break-words font-mono';
+                    respText.textContent = `Error: ${JSON.stringify(data, null, 2)}`;
+                }
+            } catch (err) {
+                respArea.classList.remove('hidden');
+                respText.className = 'text-xs text-red-400 whitespace-pre-wrap break-words font-mono';
+                respText.textContent = `Connection failed: ${err.message}\nMake sure http://localhost:8000 is running and CORS is enabled if testing locally.`;
+            } finally {
+                // UI Reset
+                btn.disabled = false;
+                spinner.classList.add('hidden');
+                btn.classList.remove('opacity-80');
+            }
+        });
+    </script>
+</body>
+</html>

@@ -1,0 +1,50 @@
+# ── Python ────────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.pyo
+*.pyd
+.Python
+
+# ── Virtual Environments ──────────────────────────────────────────────────────
+venv/
+.venv/
+ENV/
+env/
+
+# ── Secrets — NEVER commit these ─────────────────────────────────────────────
+.env
+*.env
+!.env.example          # Template is safe to commit
+
+# ── IDE ───────────────────────────────────────────────────────────────────────
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# ── Uploads & Data ────────────────────────────────────────────────────────────
+uploads/
+data/
+/tmp/
+
+# ── Model caches (large binary files) ────────────────────────────────────────
+.cache/
+*.cache/
+
+# ── Docker data volumes (local bind-mounts if used) ──────────────────────────
+rag_db_data/
+redis_data/
+rabbit_data/
+seaweedfs_*/
+
+# ── Logs ─────────────────────────────────────────────────────────────────────
+*.log
+logs/
+
+# ── Build artefacts ───────────────────────────────────────────────────────────
+*.egg-info/
+dist/
+build/
+req_core.txt
+req_light.txt

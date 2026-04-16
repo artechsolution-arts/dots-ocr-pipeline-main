@@ -1,0 +1,57 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RAG Complete Backend — Python Requirements
+#  Pipeline scope : Ingest → DotsOCR → Chunk → Embed → pgvector
+#  OCR engine     : DotsOCR (VLM, HuggingFace backend)     
+# ═══════════════════════════════════════════════════════════════════════════════
+
+# ── Web & API ──────────────────────────────────────────────────────────────────
+fastapi>=0.111.0
+uvicorn[standard]>=0.30.0
+python-multipart>=0.0.9
+httpx>=0.27.0
+
+# ── Database & Cache ───────────────────────────────────────────────────────────
+psycopg2-binary>=2.9.9
+pgvector>=0.2.4
+redis>=5.0.0
+hiredis>=2.3.0
+pika>=1.3.2
+
+# ── Object Storage & HTTP ─────────────────────────────────────────────────
+requests>=2.30.0
+openai>=1.0.0,<2.0.0            # Used by DotsOCR vLLM inference client
+boto3>=1.34.0
+aioboto3>=12.3.0
+
+# ── PDF & Image Handling ──────────────────────────────────────────────────────
+pypdf>=4.0.0
+pillow<12.0.0
+PyMuPDF>=1.24.0,<2.0.0        # Used by DotsOCR for page rendering
+
+# ── Chunking / Tokenisation ───────────────────────────────────────────────────
+tiktoken>=0.7.0
+rank-bm25>=0.2.2               # BM25 scoring (used by chunker metadata)
+
+# ── Embeddings ────────────────────────────────────────────────────────────────
+sentence-transformers>=2.7.0
+
+# ── DotsOCR — VLM Layout Engine ───────────────────────────────────────────────
+# PyTorch CPU build is specified in the Dockerfile via --extra-index-url;
+# list only the version constraint here so pip resolves it correctly.
+torch>=2.2.0
+torchvision>=0.17.0
+transformers==4.51.3
+accelerate>=0.26.0
+qwen-vl-utils
+huggingface-hub>=0.30.0,<1.0
+modelscope>=1.18.0,<2.0.0
+
+# ── Async & Utility ───────────────────────────────────────────────────────────
+aiohttp>=3.8.0,<4.0.0
+numpy==1.26.4
+tqdm>=4.65.0,<5.0.0
+
+# ── Front-End / Demo (Gradio Sandbox) ─────────────────────────────────────────
+gradio==4.31.0
+gradio_image_annotation
+runpod

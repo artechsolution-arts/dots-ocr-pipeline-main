@@ -1,0 +1,110 @@
+# ═══════════════════════════════════════════════════════════════════════════════
+#  RAG Complete Backend — Docker Compose
+# ═══════════════════════════════════════════════════════════════════════════════
+
+x-common-env: &common-env
+  # Database (External or Local)
+  PG_HOST:               ${PG_HOST}
+  PG_PORT:               ${PG_PORT}
+  PG_DATABASE:           ${PG_DATABASE}
+  PG_USER:               ${PG_USER}
+  PG_PASSWORD:           ${PG_PASSWORD}
+  # Cache & Messaging
+  REDIS_HOST:            ${REDIS_HOST}
+  REDIS_PORT:            ${REDIS_PORT}
+  RABBIT_HOST:           ${RABBIT_HOST}
+  RABBIT_PORT:           ${RABBIT_PORT}
+  RABBIT_USER:           ${RABBIT_USER}
+  RABBIT_PASS:           ${RABBIT_PASS}
+  # SeaweedFS / S3
+  SEAWEEDFS_MASTER_URL:  ${SEAWEEDFS_MASTER_URL}
+  SEAWEEDFS_FILER_URL:   ${SEAWEEDFS_FILER_URL}
+  SEAWEEDFS_S3_ENDPOINT: ${SEAWEEDFS_S3_ENDPOINT}
+  SEAWEEDFS_BUCKET:      ${SEAWEEDFS_BUCKET}
+  SEAWEEDFS_ACCESS_KEY:  ${SEAWEEDFS_ACCESS_KEY}
+  SEAWEEDFS_SECRET_KEY:  ${SEAWEEDFS_SECRET_KEY}
+  # OCR & Embedding
+  DOTS_OCR_MODEL:        ${DOTS_OCR_MODEL}
+  DOTS_OCR_USE_HF:       ${DOTS_OCR_USE_HF}
+  DOTS_OCR_WEIGHTS:      /app/weights/DotsOCR
+  EMBEDDING_DEVICE:      ${EMBEDDING_DEVICE}
+  UPLOAD_DIR:            ${UPLOAD_DIR}
+  LOG_LEVEL:             ${LOG_LEVEL}
+
+services:
+
+  # ── PostgreSQL ──────────────────────────────────────────────────────────────
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: rag-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DATABASE}
+    networks:
+      - rag-net
+
+  # ── Redis ───────────────────────────────────────────────────────────────────
+  redis:
+    image: redis:7-alpine
+    container_name: rag-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    networks:
+      - rag-net
+
+  # ── RabbitMQ ────────────────────────────────────────────────────────────────
+  rabbitmq:
+    image: rabbitmq:3.13-management-alpine
+    container_name: rag-rabbitmq
+    restart: unless-stopped
+    ports:
+      - "5672:5672"
+      - "15672:15672"
+    networks:
+      - rag-net
+
+  # ── FastAPI Application ─────────────────────────────────────────────────────
+  api:
+    build: .
+    image: rag_complete_backend:latest
+    container_name: rag-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      <<: *common-env
+      RUN_TYPE: api
+    env_file:
+      - .env
+    volumes:
+      - ../../dots_ocr:/app/dots_ocr:ro        # Mount local dots_ocr package
+      - ../../weights:/app/weights:ro         # Mount local model weights
+      - ./uploads:/app/uploads
+    networks:
+      - rag-net
+
+  # ── Ingestion Worker ────────────────────────────────────────────────────────
+  worker:
+    build: .
+    image: rag_complete_backend:latest
+    container_name: rag-worker
+    restart: unless-stopped
+    environment:
+      <<: *common-env
+      RUN_TYPE: worker
+    env_file:
+      - .env
+    volumes:
+      - ../../dots_ocr:/app/dots_ocr:ro        # Mount local dots_ocr package
+      - ../../weights:/app/weights:ro         # Mount local model weights
+      - ./uploads:/app/uploads
+    networks:
+      - rag-net
+
+networks:
+  rag-net:
+    name: rag_pipeline_net
+    driver: bridge

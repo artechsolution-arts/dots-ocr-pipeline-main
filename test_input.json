@@ -1,0 +1,25 @@
+{
+    "input": {
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8Xw8AAoMBgD0Jf/kAAAAASUVORK5CYII="
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "<|img|><|imgpad|><|endofimg|>What is in this image?"
+                    }
+                ]
+            }
+        ],
+        "model": "model",
+        "max_completion_tokens": 512,
+        "temperature": 0.7,
+        "top_p": 0.9
+    }
+}
