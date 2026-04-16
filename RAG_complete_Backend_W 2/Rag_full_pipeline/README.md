@@ -1,44 +1,41 @@
-# Advanced RAG PDF Pipeline
+# RAG Full Pipeline
 
-A full-stack RAG (Retrieval-Augmented Generation) pipeline for PDF documents featuring:
-- **FastAPI** for API endpoints.
-- **RabbitMQ** for task queuing and dead-letter handling.
-- **Redis** for state management, rate-limiting, and SSE-based progress tracking.
-- **PostgreSQL (pgvector)** for vector search and metadata management.
-- **Ollama** for local LLM generation.
-- **Hybrid Search** (Vector + BM25) with reranking.
-- **RBAC** for secure multi-department access.
+Production ingestion service for the dots.ocr RAG pipeline. Exposes a FastAPI server that accepts PDF uploads, runs them through a 7-stage parallel processing pipeline, and stores chunks + embeddings in PostgreSQL/pgvector.
 
-## Architecture
+See the [root README](../../README.md) for full architecture, setup, and API documentation.
 
-1. **Upload**: User sends PDFs via FastAPI.
-2. **Queueing**: PDF jobs are published to RabbitMQ (Priority, Normal, or Large queues).
-3. **Processing**: Worker threads consume jobs, extract text (via OCR if needed), chunk, embed, and store in PostgreSQL.
-4. **Query**: Users query the indexed documents with hybrid search.
+## Quick Start
 
-## Setup
+```bash
+# 1. Configure environment
+cp .env.example .env   # edit PG_HOST, REDIS_HOST, RABBIT_HOST, DOTS_OCR_WEIGHTS
 
-1. **Prerequisites**:
-   - Docker (for PostgreSQL, Redis, RabbitMQ)
-   - Python 3.9+
-   - Ollama (running locally)
+# 2. Start infrastructure
+docker-compose up -d
 
-2. **Run Infrastructure**:
-   ```bash
-   docker run -d -p 5432:5432 -e POSTGRES_PASSWORD=secret -e POSTGRES_DB=ragchat pgvector/pgvector:pg16
-   docker run -d -p 6379:6379 redis:7-alpine
-   docker run -d -p 5672:5672 -p 15672:15672 rabbitmq:3-management
-   ```
+# 3. Launch
+python main.py
+```
 
-3. **Install Dependencies**:
-   ```bash
-   pip install -r requirements.txt
-   ```
+API: `http://localhost:8000`
+Docs: `http://localhost:8000/docs`
 
-4. **Launch Application**:
-   ```bash
-   python main.py
-   ```
+## Directory Structure
 
-5. **Interact**:
-   Access the UI at `http://localhost:8000/ui` (if implemented) or use Swagger docs at `http://localhost:8000/docs`.
+```
+src/
+  api/          FastAPI routes (ingest, progress SSE, storage, health)
+  config.py     All settings — override via .env
+  database/     postgres_db.py, redis_db.py, rabbitmq_broker.py
+  ingestion/
+    pipeline/   stage_pipeline.py — 7-stage threaded pipeline
+    chunking/   DocumentChunker — Markdown-aware, token-limited, overlapping
+    embedding/  MxbaiEmbedder — mxbai-embed-large-v1 (1024-dim)
+    parsing/    TextCleaner
+    preprocessing/ DocumentPreprocessor — PDF → PIL pages at 400 DPI
+  models/       Pydantic schemas
+  services/     RBAC
+  storage/      SeaweedFS client
+  worker/       pool.py — RabbitMQ consumer, decoupled ack
+main.py         Lifespan startup, worker mode flag
+```
